@@ -1,0 +1,730 @@
+# AMAR: Efficient Attention-Based Multi-User Activity Recognition from Wi-Fi CSI
+
+## Introduction
+
+AMAR is a transformer-based framework for recognizing multiple concurrent human activities from Wi-Fi Channel State Information (CSI). It formulates multi-user HAR as a set prediction problem, eliminating the need for prior occupancy knowledge or auxiliary user/location annotations.
+
+**Key Features:**
+- **Set prediction** with learnable query embeddings for concurrent activity detection
+- **Edge-cloud architecture**: Lightweight backbone (0.11M params) + RVQ (99.2% bandwidth reduction)
+- **State-of-the-art performance**: 53.4% F₁-score, 1.72× improvement in perfect prediction rate, 74% lower occupancy error
+
+## Table of Contents
+- [Project Structure](#project-structure)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Running Experiments](#running-experiments)
+- [Configuration](#configuration)
+- [Available Models](#available-models)
+
+## Project Structure
+
+```
+multi_modal_CSI/
+├── configs/                    # Configuration files
+│   └── preset.py              # Main configuration file
+│
+├── src/                        # Source code
+│   ├── models/                # Model implementations
+│   │   ├── *.py               # Implementation of models including AMAR, AMAR_WO_RVQ, DEM and 
+│   │   │                      # BCE based methods 
+│   │   ├── losses/            # Hungarian Matching Loss implementation
+│   │   └── modules/           # Reusable components in models
+│   │       ├── elements.py    # Smaller modules (DSC, AC, MemoryPositionalEncoding)
+│   │       ├── molecules.py   # Larger components (RVQ, Backbone, Encoder, ...)
+│   │       └── helper.py      # helper functions (checkpoint management, ...)
+│   │
+│   ├── data/                  # Data handling specific to WiMANS dataset
+│   │   ├── load_data.py       # Data loading functions
+│   │   └── preprocess.py      # Preprocessing utilities
+│   │
+│   ├── utils.py               # functions inside this utility are mainly for evaluation and viz
+│   ├── train.py               # training function for benchmarks and also AMAR_WO_RVQ
+│   ├── train_joint.py         # training function for MultiSenseX
+│   └── train_rvq.py           # AMAR training function
+│
+├── scripts/                     # Executable scripts
+│   ├── run_main.py              # Main experiment runner
+│   └── run_main_jointActLoc.py  # For running MultiSenseX 
+│
+├── results/                   # Output artifacts
+│   ├── checkpoints/          # Saved model weights
+│   ├── metrics/              # Performance metrics (JSON)
+│   └── figures/              # Visualization outputs
+│
+├── dataset/                   # Dataset directory (configure path in preset.py)
+├── environment.yaml           # Conda environment specification
+└── README.md                 # This file
+```
+
+## Installation
+
+ Create Conda Environment
+
+```bash
+conda env create -f environment.yaml
+conda activate AMAR
+```
+## Dataset Setup
+
+Download the WiMANS dataset from [Kaggle](https://www.kaggle.com/datasets/shuokanghuang/wimans) and extract it to the project root. Update the paths in `configs/preset.py`:
+```python
+"path": {
+    "data_x": "dataset/wifi_csi/amp",
+    "data_y": "dataset/annotation.csv",
+    "save": "results/result.json"
+}
+```
+
+**H-WILD (room-agnostic localization):** clone the [H-WILD dataset](https://github.com/H-WILD/human_held_device_wifi_indoor_localization_dataset)
+so the four room folders sit under `dataset/hwild/`:
+
+```bash
+git clone --depth 1 https://github.com/H-WILD/human_held_device_wifi_indoor_localization_dataset.git dataset/hwild
+rm -rf dataset/hwild/.git
+```
+
+The captures are MATLAB v7.3 (HDF5), so `h5py` is required (already in `environment.yaml`).
+
+**Sample Data:**
+
+<table align="center">
+  <tr align="center">
+    <td rowspan="2"><b>Sample includes these activities:<br>Walking, Sitting Down, and Picking Up</b></td>
+    <td>WiFi CSI</td>
+    <td>Synchronized Video</td>
+  </tr>
+  <tr align="center">
+    <td><img src="visualizations/wifi_csi_act_30_25.gif" height="188"/></td>
+    <td><img src="visualizations/video_act_30_25.gif" height="188"></td>
+  </tr>
+</table>
+
+## Quick Start
+
+### Basic Usage
+
+Run a single experiment with default settings:
+
+```bash
+conda activate AMAR
+python scripts/run_main.py
+```
+
+### With Custom Parameters
+
+```bash
+python scripts/run_main.py --model AMAR --task activity --repeat 3 --users "0,1,2,3,4,5"
+```
+
+### Available Arguments
+
+- `--model`: Model name (default: from preset.py)
+- `--repeat`: Number of experiment repetitions (default: from preset.py)
+- `--users`: Comma-separated list of user IDs (default: "0,1,2,3,4,5")
+
+## Running Experiments
+
+### 1. Configure Experiment Settings
+
+Edit `configs/preset.py` to set:
+
+```python
+preset = {
+    "model": "AMAR",              # Choose your model
+    "task": "activity",                # activity, identity, or location
+    "repeat": 8,                       # Number of runs
+    "path": {
+        "data_x": "/path/to/wifi_csi/amp",        # CSI amplitude data
+        "data_y": "/path/to/annotation.csv",       # Annotations
+        "save": "results/result.json"              # Results output
+    },
+    "data": {
+        "num_users": ["0","1","2","3","4","5"],   # User selection
+        "wifi_band": ["5"],                         # WiFi band (2.4 or 5 GHz)
+        "environment": ["empty_room"],              # Environment type
+        "length": 3000,                             # CSI sequence length
+        "csi_type": "amplitude",                    # "amplitude" or "phase"
+    },
+    "nn": {
+        "lr": 5e-4,                    # Learning rate
+        "epoch": 300,                    # Training epochs
+        "batch_size": 16,              # Batch size
+        # ... more hyperparameters
+    }
+}
+```
+
+**CSI representation (amplitude vs phase).** `preset["data"]["csi_type"]` selects what every WiMANS
+loader reads; `"amplitude"` (the default) is the historical behaviour, `"phase"` reads phase tensors
+instead. The phase tensors are extracted from the raw complex CSI in `dataset/wifi_csi/mat/*.mat` with
+
+```bash
+python src/data/preprocess.py --what phase      # writes dataset/wifi_csi/phase/<label>.npy
+```
+
+Each source keeps its two representations side by side (`.../wifi_csi/amp` and `.../wifi_csi/phase`),
+and `src/data/phase.py:csi_dir` swaps the trailing `amp` segment for `phase`, so the real, simulated and
+anywhere sources resolve through the same code path. Raw CSI phase is dominated by a per-frame constant
+offset and a linear ramp across subcarriers (packet timing and sampling-time/CFO);
+`preset["data"]["phase"]["sanitize"]` decides what to do with it — `"linear"` (default) unwraps the
+subcarrier axis and subtracts each frame's linear trend (SpotFi-style), `"none"` keeps the raw wrapped
+phase. The sanitisation is applied on load, so one extracted file serves either setting. Only the real
+WiMANS source ships `.mat` captures, so a phase run must disable the amplitude-only synthetic sources
+(`synth_wimans.enabled=false` and `synth_wimans.anywhere=false`). Switch per run without editing the
+file with `--hp data.csi_type=phase`.
+
+### 2. Run Experiments
+
+**Single model experiment:**
+```bash
+python scripts/run_main.py --model AMAR 
+```
+
+**Few-shot distillation experiment (AMAR_WO_RVQ):**
+```bash
+python scripts/run_few_shot.py --model AMAR_WO_RVQ --task location --env empty_room \
+    --repeat 3 --few_shot_ratio 0.05 --epochs 200 --kd_weight 1.0
+```
+This trains on the single environment `--env` and tests on every other environment in
+`preset["data"]["environment"]`. A teacher `AMAR_WO_RVQ` is trained on the full training
+environment, frozen, and used to supervise a student `AMAR_WO_RVQ` trained on `--few_shot_ratio` of
+that same environment with `HungarianMatchingLoss + kd_weight * SetDistillationLoss`. Distillation
+matches student queries to teacher queries with a Hungarian assignment on the final-layer class
+probabilities, so it is invariant to the arbitrary query ordering of set prediction. Extra
+arguments: `--kd_temperature` (soft-target temperature), `--teacher_epochs` (defaults to
+`preset["nn"]["epoch"]`), `--no_compile`.
+
+### 3. Room-agnostic localization on H-WILD
+
+`scripts/run_hwild.py` trains a single-target localizer (the THAT CSI backbone + a regression head,
+`RoomLocalizer` in `src/models/room_localization.py`) and evaluates it leave-one-room-out: it
+predicts an (x, y) position per CSI window and reports the Euclidean error in meters on the held-out
+room.
+
+```bash
+# train on the other three rooms, test on Lounge
+python scripts/run_hwild.py --holdout Lounge --repeat 3 --epochs 60
+
+# quick smoke test on a few captures per room
+python scripts/run_hwild.py --holdout Lounge --max_files 4 --epochs 2 --repeat 1
+
+# the same run with the ResNet1D localizer instead of the THAT one
+python scripts/run_hwild.py --holdout Lounge --backbone resnet1d --repeat 3 --epochs 60
+```
+
+`--backbone` picks the localizer: `that` (default) is `RoomLocalizer` over the WiMANS THAT backbone,
+`resnet1d` is `ResNet1DLocalizer` over the CSI window (`src/models/resnet1d.py`, the
+ResNet1D-[1,1,1,1] of the WiMANS paper with its own MLP head). Both are complete models behind the same
+`(batch, time, features) -> (batch, 2)` contract, resolved in one place by
+`src.models.room_localization.localizer_class` — which is also what a checkpoint records, so a
+saved ResNet1D run reloads as one.
+
+Positions live in a fixed per-room `[0, 1]^2` frame built from the dataset's own coordinate grid
+(`src/data/hwild.py`, transcribed from `obtain_parameters.m`), so a model trained on some rooms
+predicts normalized coordinates that denormalize to meters in any room. Per-room metrics, prediction
+scatters and a training-curve plot are written under `visualizations/hwild/`, and the JSON/TXT report
+under `output/hwild/`. The per-room `predictions_<room>.png` puts the training rooms' positions (a prior
+cloud), the ground truth, the prediction and the **constant (mean training position) baseline** in
+one figure, so the constant the report prints as an error is also visible as a point, and a prediction
+cloud sitting on the prior says the model learned the training rooms and nothing else. Each test room
+also gets the standard performance figures
+(`count_distributions`, `confusion_matrices`, `confusion_matrices_norm`, `error_distribution`,
+`class_errors`, `prediction_scatter`) with the room's `[0,1]^2` frame split into a fixed
+`preset["viz"]["grid"]` x `preset["viz"]["grid"]` cell grid as the "locations".
+
+Every report also prints a **constant-position baseline** (the mean training-room position). It is the
+reference a room-agnostic model must beat to show it learned a transferable CSI-to-position mapping
+rather than predicting a room's centre: on the raw single-AP CSI amplitude this task is hard, and the
+current model does not beat that baseline on most held-out rooms. Next to it every report prints a
+**grid-cell occupancy accuracy** (the fraction of frames whose predicted position is in the same
+`preset["viz"]["grid"]` x grid cell as the ground truth), a coarse localization readout that is
+complementary to the meter-scale error. The harness is the starting point
+for closing that gap (e.g. multi-AP fusion, AP-geometry conditioning, AoA features).
+
+### 4. Pooled leave-one-room-out across WiMANS + H-WILD
+
+`scripts/run_lor_all.py` pools all 7 rooms (WiMANS `empty_room`/`meeting_room`/`classroom` +
+H-WILD `Conference`/`Laboratory`/`Office`/`Lounge`) into one shared per-room `[0, 1]^2` frame and
+runs leave-one-room-out over the union, so a held-out room may come from either dataset:
+
+```bash
+# hold out every room in turn and report the per-room table
+python scripts/run_lor_all.py --folds all --max_per_room 200 --epochs 20 --repeat 2
+
+# hold out one random room (seeded)
+python scripts/run_lor_all.py --holdout random --max_per_room 200 --epochs 20 --repeat 2
+
+# the continuous density head instead of the general set-prediction model
+python scripts/run_lor_all.py --model density --folds all --max_per_room 200 --epochs 20
+```
+
+Two heads share the pooled setup (`--model`):
+
+- **`set` (default, general):** `src/models/set_localization.py` predicts a fixed set of position
+  queries with objectness logits, trained with a Hungarian assignment (the AMAR set-prediction
+  formulation). It needs no per-room location knowledge, and count and location are linked by
+  construction — the count is the number of queries asserting an object, each matched to a position,
+  so there is no separate peak detector to over/under-count. The objectness threshold is calibrated
+  on the training rooms' validation split.
+- **`density`:** `src/models/room_density.py` predicts a continuous occupancy map and extracts peaks.
+
+`src/data/unified_rooms.py` builds the shared frame and keeps the **multi-user** label: a WiMANS
+sample's label is the set of its occupied discrete locations (one per user, up to 6, empty room =
+empty set), an H-WILD sample's is a one-element set (the person's UWB position). Both are made
+90-feature (WiMANS averages its 3 TX antennas) and resampled to the common window length.
+`src/models/room_density.py` trains the continuous density head on the rendered multi-user target
+(sum of peak-normalized Gaussians at the label positions) and evaluates by matching the predicted
+map's peaks to the true set with a Hungarian assignment, so the reported error keeps the multi-user
+structure: set error (matched distance + per-miss penalty), matched MDE, count MAE, exact-count
+accuracy and detection P/R/F1. The report prints the constant-position baseline next to every room,
+so a run that only predicts a room centre is obvious. Outputs go to `output/lor_all/*.json|txt` and,
+per fold, `visualizations/lor_all/<model>/holdout_<room>/<test_room>/` (training curves, position
+scatter, and the standard per-location figures on the fixed `preset["viz"]["grid"]` cell grid).
+
+The older, WiMANS-only cross-domain runner (`scripts/run_cross_domain.py`, driven by
+`scripts/cross-domain.sh` and `scripts/cross_domain_3_env.sh`) trains on one or two WiMANS rooms and
+tests on every remaining one. Its `--task location` runs now also write a **position scatter** per test
+room (`predictions_<room>.png`): the true and the predicted WiMANS location positions in meters from the
+transmitter, one marker per occupied location per frame, plus a **constant-baseline marker** — the
+occurrence-weighted mean of the training rooms' locations, placed in the test room's layout, i.e. the
+point "always predict the average location" lands on — and, drawn underneath, the **training prior**:
+the training rooms' locations as a cloud (`location_prior_positions`, one row per training
+frame × location, scaled down when it would be huge), so the same figure answers "do the predictions
+sit on the training rooms' prior?" without a second plot. That makes the reference the reports print as a
+number visible against the prediction cloud. It is
+built from the class indices of the labels and of the model's last decoder layer, mapped through
+`preset["encoding"]["location"]` and `preset["layouts"]` (the same bank is echoed as
+`location_positions_m` in the run's JSON). `AMAR_WO_RVQ` draws it, and the `dummy_model` constant
+baseline draws it too — there the cloud *is* the training prior, so the same marker is drawn beside it
+as the "always say the average training location" reference; the density heads keep their own spatial
+figures (density map, coordinate heatmap).
+
+### 5. H-WILD → WiMANS transfer in a shared transmitter-anchored frame
+
+`scripts/run_hwild_to_wimans.py` trains a room-agnostic model on H-WILD and evaluates it on the WiMANS
+locations. `--model localizer` (default) is the single-target `RoomLocalizer`, reporting the error in
+meters; `--model density` is the multi-user density head, which also reports occupancy/detection (see
+below). The two datasets have no shared room origin,
+so both are placed in one **transmitter-anchored frame**: origin at the transmitter, `+y` along the
+boresight ("away from the transmitter"), `+x` to the right, units of meters.
+
+- WiMANS is already in this frame — `preset["layouts"]` is transmitter-anchored, so the positions
+  come straight out as meters from the transmitter (`load_wimans_room_targets`, single-occupant
+  frames only, since the localizer predicts one position).
+- H-WILD is mapped into it by `src/data/hwild.tx_frame_xy`, using the AP geometry (`ap_location`,
+  `ap_toward`) transcribed from the dataset's `obtain_parameters.m` into `HWILD_ROOMS`.
+  `load_hwild_room(var_frame="tx")` returns those positions; the default `var_frame="room"` keeps the
+  original per-room `[0,1]^2` UWB grid that `run_hwild.py` uses.
+
+One rectangle over every loaded position then normalises both datasets for the `RoomLocalizer`
+harness, so the reported error is a plain Euclidean distance in meters (the per-room span convention
+is not used here). `--standardize window` (default) z-scores each CSI window, removing the
+per-capture gain/AGC scale that otherwise differs between the two datasets; `--standardize none`
+feeds raw amplitude.
+
+```bash
+python scripts/run_hwild_to_wimans.py --repeat 2 --epochs 40 --max_files 3 --standardize window
+python scripts/run_hwild_to_wimans.py --standardize none     # raw-amplitude ablation
+
+# ResNet1D localizer instead of RoomLocalizer (--model density has its own backbone and rejects it)
+python scripts/run_hwild_to_wimans.py --backbone resnet1d --repeat 2 --epochs 40 --max_files 3
+```
+
+`--backbone that|resnet1d` selects the localizer the `localizer` model trains (see §3); the run's JSON
+records the choice, and the per-room `predictions_<room>.png` scatter shows where the predictions land
+rather than only their error — the training rooms' positions as a prior cloud underneath, true,
+predicted and the constant (mean training position) baseline in one figure, so "does not beat the
+constant" is visible and not only printed.
+
+**`--model density`** swaps the single-target regressor for the multi-user density head
+(`src/models/room_density.py`), which predicts an occupancy map and reports occupancy/detection
+(count MAE, exact-count accuracy, detection P/R/F1) next to the set-localization error — so the
+transfer can be read on occupancy, not only on position. Unlike the localizer path it keeps rooms in
+their own `[0, 1]^2` frame (the `src/data/unified_rooms.py` convention `run_lor_all.py` uses) and
+keeps every frame, multi-occupant and empty-room WiMANS frames included. H-WILD has no empty frames
+(the person always holds the device), so a teacher trained on H-WILD alone has no empty class and the
+WiMANS empty-frame metrics measure exactly that.
+
+```bash
+python scripts/run_hwild_to_wimans.py --model density --repeat 2 --epochs 40 --max_samples 300
+```
+
+Reports go to `output/hwild_to_wimans/*.json|txt` and figures to
+`visualizations/hwild_to_wimans/<train_rooms>/<test_room>/` (or
+`visualizations/hwild_to_wimans_density/<train_rooms>/` for the density head). Every report carries the
+constant-position baseline; a run that does not beat it has not learned a transferable mapping. The
+current model fits H-WILD validation (≈1.5 m) but does not transfer to WiMANS (test MDE ≈9 m vs a
+≈8.4 m constant baseline) — the H-WILD channel is a device link (the person holds the transmitter),
+while WiMANS is passive scattering, so a range/position cue learned on one need not survive on the
+other.
+
+### 6. H-WILD → WiMANS few-shot knowledge distillation
+
+`scripts/run_few_shot_hwild_to_wimans.py` turns the transfer run above into a few-shot distillation,
+mirroring the repo's other few-shot harnesses (`run_few_shot.py`, `run_AMAR_WO_RVQ_few_shot`,
+`run_density_map_few_shot`):
+
+- **Teacher** — `RoomLocalizer` trained on every H-WILD room, then frozen.
+- **Student** — `RoomLocalizer` warm-started from the teacher and fine-tuned on `--few_shot_ratio` of
+  the WiMANS pool with the supervised Huber position loss plus `--kd_weight` × a smooth-L1 match to
+  the frozen teacher on the same support windows. `RoomLocalizer` is a single-target regressor, so the
+  distillation term is a plain element-wise match — no Hungarian assignment, unlike
+  `SetDistillationLoss` (`src/models/losses/supervised_loss.py`).
+- **Test** — the WiMANS frames held out of both the support set and the student's validation slice.
+  Teacher and constant-position baseline are reported alongside.
+
+Both datasets sit in the shared transmitter-anchored frame, so positions are comparable in meters.
+
+```bash
+python scripts/run_few_shot_hwild_to_wimans.py --few_shot_ratio 0.05 --kd_weight 1.0
+python scripts/run_few_shot_hwild_to_wimans.py --few_shot_ratio 0.05 --kd_weight 0    # ablation
+```
+
+**Read the `--kd_weight 0` run as the honest reference.** The teacher's own WiMANS error is *worse*
+than the constant baseline (H-WILD's device-link channel does not transfer to WiMANS passive
+scattering — see section 5), so the distillation term pulls the student toward weak targets. Run both
+weights and compare the student column; if `kd_weight 1.0` does not beat `0`, the teacher is dead
+weight and the few-shot gain is coming from the WiMANS support set alone.
+
+Reports go to `output/few_shot_hwild_to_wimans/*.json|txt`; curves to
+`visualizations/few_shot_hwild_to_wimans/<train_rooms>/`. Each room's report lists MDE (mean distance
+error), RMSE and median error in meters — with the standard error over repeats for the student and the
+teacher, and as single values for the constant baseline. It also reports a **grid-cell occupancy
+accuracy**: the fraction of query frames whose predicted position lands in the same
+`preset["viz"]["grid"]` x grid cell of the shared frame as the ground truth (the same cells the
+per-location figures use), for the student, the teacher and the constant baseline. On this
+single-target task every frame has exactly one occupied cell, so the per-location occupancy F1
+coincides with the accuracy and is not reported separately.
+
+### 7. NTU-Fi HAR → WiMANS activity transfer (pure split)
+
+`scripts/run_ntu_to_wimans.py` trains `AMAR_WO_RVQ` on NTU-Fi HAR and tests it on the WiMANS activity
+task with no WiMANS training at all. NTU-Fi HAR comes from the [SenseFi
+benchmark](https://github.com/xyanchen/WiFi-CSI-Sensing-Benchmark) and is expected under
+`dataset/ntu_har/` in that repo's layout:
+
+```bash
+git clone --depth 1 https://github.com/xyanchen/WiFi-CSI-Sensing-Benchmark /tmp/sensefi
+# place the processed NTU-Fi_HAR data as:
+#   dataset/ntu_har/train_amp/<class>/<class><i>.mat     936 captures
+#   dataset/ntu_har/test_amp/<class>/<class><i>.mat      264 captures
+python scripts/run_ntu_to_wimans.py --repeat 3 --epochs 60
+```
+
+`src/data/ntu_har.py` reproduces the benchmark's own preprocessing exactly (`CSIamp`, standardised with
+the dataset's global mean/std, packets decimated `2000 → 500` with `x[..., ::4]`), so windows match
+what SenseFi's models see. The release is distributed with the CSI axes in different orders —
+`(3, 114, 2000)`, `(3, 2000, 114)` — and some copies flatten the antenna × subcarrier plane, so
+`load_ntu_har_array()` identifies the axes by their lengths (3 antennas, 114 subcarriers, the
+remaining axis is packets) instead of assuming one layout; an unrecognised shape fails with the
+observed shape in the message.
+
+**The label space is the constraint.** NTU-Fi HAR labels six activities (`box`, `circle`, `clean`,
+`fall`, `run`, `walk`) and WiMANS labels nine (`nothing`, `walk`, `rotation`, `jump`, `wave`,
+`lie_down`, `pick_up`, `sit_down`, `stand_up`), so "train on one, test on the other" is only defined on
+the activities both of them have. Both sides are mapped onto one class ordering plus the AMAR_WO_RVQ
+no-object class, which is what makes this a real classification protocol rather than a label-space
+mismatch. `--activities` picks that ordering:
+
+| `--activities` | classes | WiMANS frames kept | what it measures |
+|---|---|---|---|
+| `shared` (default) | `walk` (1) | walk only | the strict intersection: walk against no-object, no negatives, every query frame positive — the teacher is already perfect, so the run only shows whether fine-tuning degrades it |
+| `walk_nothing` | `nothing`, `walk` (2) | walk + nothing | walking against WiMANS's idle frames. NTU-Fi HAR has no `nothing` capture, so the class is target-only and only the few-shot student can learn it |
+| `union` | all 14 | every activity | the 6 NTU-Fi HAR classes plus the 9 WiMANS activities (`walk` shared). The teacher is trained on 6 and tested on all 9, the 8 target-only activities included |
+
+```bash
+python scripts/run_ntu_to_wimans.py --activities union --repeat 3 --epochs 60
+python scripts/run_few_shot_ntu_to_wimans.py --activities walk_nothing --few_shot_ratio 0.1 --kd_weight 0.1
+```
+
+The default is `shared`, the identity intersection of the two vocabularies. Activities are matched by
+name — a class keeps its own name on both sides — so the vocabulary is the only thing that decides the
+class ordering; there is no cross-vocabulary mapping table.
+
+Under `shared` the task degenerates to a single activity against no-object and every query frame is
+positive — the runner says so in its log. **Every report therefore carries the "always name the most
+frequent NTU-Fi HAR activity" baseline.** On a single-activity vocabulary that baseline is already
+perfect, so a run that only matches it has learned nothing; the comparison to make is model vs
+baseline, not model alone.
+
+**Read `microF1`/`presentF1`, not `Acc(TN-inflated)`.** Each WiMANS query frame holds one activity, so
+of the vocabulary's `C` activity classes `C-1` are absent from it. `calculate_scores`' `accuracy` is a
+mean of per-class accuracies in which an absent, correctly-not-predicted class is a true negative, so
+it is dominated by those negatives and sits near `(C-2)/C` whatever the model does — on the 14-class
+union vocabulary that is `0.857`, which is exactly the majority baseline's number, and a *random*
+single-activity guess scores `0.868` against the few-shot student's `0.879`. The same averaging over
+all classes deflates `f1_score` (absent classes contribute `0`). The report therefore also prints
+`micro_f1` (pooled `2TP/(2TP+FP+FN)`), `present_f1` and `present_recall` (macro over the classes the
+ground truth actually contains), which are not distorted by absence, and the few-shot report prints
+how many of `num_obj_queries` slots the Hungarian matching used. `train` (`src/train.py`) selects the
+checkpoint it returns on validation `preset["nn"]["select_metric"]`: `"ppp"` (perfect-prediction
+percentage, the historical default, so pre-existing runs stay reproducible) or `"micro_f1"`. The NTU
+runs opt into the latter with `--hp nn.select_metric=micro_f1`, so the reported weights are the best
+micro-F1 epoch rather than the best TN-inflated-accuracy or PPP epoch.
+
+Beyond `--activities` and `--wimans_rooms`/`--standardize`, both runners read the data setup from the
+preset — dataset roots, features, band, window length and occupant filter have no dedicated flags.
+`--hp <dotted.path>=<value>` overrides any preset field for one run:
+
+```bash
+python scripts/run_ntu_to_wimans.py --activities union --hp ntu_har.path=/data/ntu_har
+```
+
+Two alignment choices, both preset fields:
+
+- **Features.** NTU-Fi HAR has 3 antennas × 114 subcarriers and WiMANS 3 TX × 3 RX × 30, so one model
+  cannot consume both as they are. `preset["ntu_har"]["features"] = 270` (default) keeps WiMANS's
+  native flattening, the representation the repo's own WiMANS runs use, and resamples the NTU-Fi HAR
+  subcarrier axis `114 → 90` to match; 90 instead averages the WiMANS TX antennas, the convention
+  `src/data/unified_rooms.py` uses to match H-WILD.
+- **Gain.** `--standardize window` (default) z-scores every CSI window, removing the per-device
+  gain/AGC scale that differs between the two datasets (same alignment as
+  `run_hwild_to_wimans.py`); WiMANS statistics are taken over the real packets only, excluding the
+  leading zero padding. `--standardize none` feeds raw amplitude.
+
+WiMANS frames are kept when *every* occupant performs a shared activity; `preset["data"]["num_users"]`
+is not what filters them — `load_wimans_activity` defaults to single-occupant frames (`"1"`), matching
+NTU-Fi HAR's single-person captures. Both runners expose that as `--wimans_users` (default `"1"`, e.g.
+`--wimans_users 1,2,3`): a wider filter tests set-size generalisation through the same set-prediction
+head, and — because a single-occupant frame gives the Hungarian matching only one real target — it is
+also what lets the head's queries specialise instead of collapsing onto one slot. It also scales the
+pool linearly: a WiMANS frame is `(3000, 270)` float32 (~3 MiB), so the union pool at `1,2,3` over the
+six rooms is ~20 GiB. The few-shot runner therefore streams the pool room by room
+(`prepare_transfer_task(..., var_stream_pool=True)`), reading only the frames each indexing step
+touches; the pure-split runner materializes just its query split.
+
+Reports go to `output/ntu_to_wimans/*.json|txt` and figures to `visualizations/ntu_to_wimans/` — the
+confusion-matrix panel plus the head-clustering figure the *What the head does with the query frames*
+section describes, drawn for this runner's single model (no teacher/student pair to contrast here), and
+the cross-room embedding-metadata figure that comes with it.
+
+### 8. NTU-Fi HAR → WiMANS few-shot knowledge distillation
+
+`scripts/run_few_shot_ntu_to_wimans.py` turns the run above into a few-shot distillation, mirroring
+the other few-shot harnesses (`run_few_shot.py`, `run_few_shot_hwild_to_wimans.py`):
+
+- **Teacher** — `AMAR_WO_RVQ` trained on every NTU-Fi HAR capture of the `--activities` vocabulary, then
+  frozen. This is exactly the model `run_ntu_to_wimans.py` reports.
+- **Student** — `AMAR_WO_RVQ` warm-started from the teacher and fine-tuned on `--few_shot_ratio` of
+  the WiMANS pool with `HungarianMatchingLoss + kd_weight * SetDistillationLoss` against the frozen
+  teacher. `--kd_weight 0` is the supervised-only ablation. `SetDistillationLoss` assigns the student's
+  queries only to the teacher's **real** queries (`argmax != no-object`): matching them to the
+  teacher's no-object queries would push every other student query to no-object and re-impose a
+  collapsed teacher's single-slot layout, and the teacher's no-object mass would suppress the classes
+  it never saw. The student queries the assignment leaves unmatched are decided by the supervised loss
+  alone, which is what lets them spread over a frame's several occupants (`--wimans_users 1,2,3`).
+- **Test** — the WiMANS query frames, held out of both the support set and the student's validation
+  slice. Teacher and majority-activity baseline are reported next to the student.
+
+`--activities` (see section 7) decides what the WiMANS test set holds, so the same script covers both
+protocols: the walk-only transfer, and the full-vocabulary one where the NTU-Fi HAR teacher meets all
+nine WiMANS activities.
+
+```bash
+# teacher on NTU-Fi HAR -> few-shot KD on WiMANS, target test = walking vs nothing
+python scripts/run_few_shot_ntu_to_wimans.py --activities walk_nothing --few_shot_ratio 0.1 --kd_weight 0.1
+
+# same protocol over the union of both vocabularies (14 classes)
+python scripts/run_few_shot_ntu_to_wimans.py --activities union --few_shot_ratio 0.1 --kd_weight 0.1
+python scripts/run_few_shot_ntu_to_wimans.py --activities union --few_shot_ratio 0.1 --kd_weight 0    # ablation
+```
+
+`scripts/ntu_wimans.sh` runs both of those on SLURM. The runner takes `--activities`, the few-shot
+knobs above and the same `--wimans_rooms`/`--wimans_users`/`--standardize` as the pure-split runner;
+everything else (dataset roots, features, band, window length) comes from the preset and is overridable
+per run with `--hp`.
+
+**The two protocols are scored on the same frames.** Both runners build the task through
+`src.data.activity_transfer.prepare_transfer_task`, which splits the WiMANS pool with one fixed seed
+(39) and the same `--few_shot_ratio`; the pure-split runner is evaluated on the query split rather
+than the whole pool, so its numbers sit directly beside the few-shot student's. Pass both runners the
+same `--activities`: the pool, and therefore the query frames, depend on the vocabulary. Reports go to
+`output/few_shot_ntu_to_wimans/*.json|txt` and figures to
+`visualizations/few_shot_ntu_to_wimans/`.
+
+### 9. Simulated WiMANS data
+
+`dataset/synth_wimans/` (generated with `human-csi-sim`) holds two simulated WiMANS-format sets —
+each one annotation CSV in WiMANS's columns plus `wifi_csi/amp/<label>.npy` per sample, with identical
+groups, trials and placement:
+
+- `fewshot-groups-3x3-wimans/` — `(time, 3, 3, 30)`, WiMANS's antenna geometry. **This is what
+  `preset["data"]["synth_wimans"]` loads by default.**
+- `fewshot-groups-wimans/` — `(time, 1, 1, 30)`, one antenna pair (the 3 x 3 set's middle).
+
+Two of the set's properties differ from real WiMANS and are handled at the data layer, so it can be
+loaded through the same loaders:
+
+- **Antenna geometry.** The 3 x 3 set matches real WiMANS and loads unchanged. The 1 x 1 set is put
+  on the 3 x 3 grid by `src.data.load_data.harmonize_wimans_antennas`, which broadcasts the single
+  link, so it loads with the same feature count and no model change; the copies add no channel
+  diversity the source does not have. Point the preset's `synth_wimans.data_x`/`data_y` at
+  `fewshot-groups-wimans/` to use it (e.g. `--hp data.synth_wimans.data_x=...`). The localization
+  loaders take either the full 3 x 3 x 30 grid (270 features, for a WiMANS-only run) or one antenna
+  axis averaged (90, H-WILD's layout, needed by the H-WILD -> WiMANS transfer) via
+  `load_wimans_room(_targets)(..., var_antennas="full"/"avg")` (the `--features` flag of
+  `scripts/run_few_shot_multi_rooms.py`).
+- **Activity names.** The simulator labels a sitting occupant `sit`, which the preset vocabulary does
+  not name (`sit_down`/`stand_up`). `src.data.activity_transfer.WIMANS_ACTIVITY_ALIASES` maps it to
+  `sit_down` (the simulator's action behind it is `sitting`, never standing); without the alias a
+  `--activities union` run drops every frame holding a `sit` occupant (1478 of its 2715).
+
+Its annotation rows are 2.4 GHz while `preset["data"]["wifi_band"]` defaults to `["5"]`, and its
+`environment` values are the same three room names real WiMANS uses, so a run that mixes the two sets
+has to select the band and key the rooms per source. `wimans_room_names()` lists the real rooms plus
+`<room><suffix>` for the simulated ones and `wimans_room_source()` resolves a key to its source, base
+room and band; the WiMANS harnesses go through them, so `--hp data.synth_wimans.enabled=true` adds the
+simulated rooms to the pool. In the cross-domain runner (`scripts/run_cross_domain.py`) they become test
+rooms unless they are named in `--train_envs`; their CSI is read through
+`src.data.load_data.load_wimans_room_x` (the same 270-feature harmonization as the real rooms), they
+reuse their base room's layout, and each room is held as a `LazyRoomArray` so a run over many rooms
+never keeps them all resident — a training room is read once when its dataset is built, a test room once
+per repeat inside the evaluation loop.
+
+### What the head does with the query frames
+
+`src/models/set_clustering.py` draws the set-prediction head's own grouping. The head emits
+`num_obj_queries` slots and the loss matches them to a sample's occupants with the Hungarian
+algorithm, so every occupant lands on one slot and the samples that land on the same slot are the group
+the head treats as one thing. On the last repeat the few-shot runner draws that for the teacher and the
+student, per environment, into
+`visualizations/few_shot_ntu_to_wimans/<run>/<environment>/clustering_teacher_r<k>.png` and
+`clustering_student_r<k>.png`; the pure-split runner draws the same figure for its single model into
+`visualizations/ntu_to_wimans/<run>/<environment>/clustering_model_r<k>.png`. Both then put the per-slot
+and per-cluster summaries (`samples`, `top_activity`, `purity`; slots also carry `predicted_class`)
+under `per_env.<environment>.clustering` in the run's JSON.
+
+Each figure has: the query embeddings of the matched slots in a t-SNE coloured by true activity; the
+same points coloured by a KMeans clustering of those matched-slot embeddings, each cluster labelled
+with its dominant activity and purity; the KMeans cluster × true-activity and the head's slot ×
+true-activity contingencies; and one panel per KMeans cluster with the cross-attention profile of the
+slot each of its samples was matched to, one line per attention head
+(`TransformerDecoderLayer` already keeps the per-head weights; `TransformerDecoder.forward` gained
+`return_embedding` so the figure can also show the embeddings `class_embed` reads off). Attention is
+plotted against *relative* packet position, so the profiles of a teacher whose backbone sees 500-packet
+NTU-Fi HAR windows and a student on 3000-packet WiMANS windows share one x-axis.
+
+Note the slot index of a *target* carries no meaning — `build_activity_set_labels` permutes the target
+query order per sample — but the model's slots are shared across samples, and those are what the
+matching recovers.
+
+**On the single-occupant NTU-Fi HAR → WiMANS task the head uses one slot.** Every WiMANS frame holds
+one occupant, so the Hungarian matching has exactly one real target per frame: whichever query
+currently scores it highest wins it and the other `num_obj_queries - 1` queries are matched to
+no-object targets and trained to be dead. Both the teacher and the student collapse to a single
+query, which the report prints as `Slots ... 1/10 used`. This is structural, not a training accident —
+a set predictor has nothing to spread over when no frame contains more than one object — so per-activity
+query clustering is not a property this protocol can exhibit. Two levers address it, both now in the
+runners:
+
+- `--wimans_users 1,2,3` widens the occupant filter, so the matching has more than one real target per
+  frame and the queries have something to specialise on.
+- `SetDistillationLoss` now assigns the student's queries only to the teacher's **real** queries. Before
+  this it matched *all* of them to the teacher's — including the teacher's nine no-object queries, so
+  it re-imposed the teacher's collapse — and its soft target carries ~0 mass on the activities only
+  WiMANS labels, so it taught the student to ignore them. Unmatched student queries are now decided by
+  the supervised loss alone.
+
+## Available Models
+
+| Model | Type | Description | Reference |
+|-------|------|-------------|-----------|
+| `AMAR` | Proposed | Attention-based multi-user HAR with RVQ | This work |
+| `AMAR_WO_RVQ` | Proposed | AMAR without quantization | This work |
+| `BCE_ABLSTM` | Baseline | Attention-based Bi-directional LSTM + BCE loss | [Chen et al., TMC'19](https://doi.org/10.1109/TMC.2018.2878233) |
+| `BCE_THAT` | Baseline | Two-stream Transformer + BCE loss | [Li et al., AAAI'21](https://ojs.aaai.org/index.php/AAAI/article/view/16103) |
+| `DEM_ABLSTM` | Baseline | Attention-based Bi-directional LSTM + Smooth L1 | [Chen et al., TMC'19](https://doi.org/10.1109/TMC.2018.2878233) |
+| `DEM_THAT` | Baseline | Two-stream Transformer + Smooth L1 | [Li et al., AAAI'21](https://ojs.aaai.org/index.php/AAAI/article/view/16103) |
+
+**Note:** BCE variants follow the WiMANS dataset formulation [[Huang et al., arXiv'24]](https://arxiv.org/abs/2402.09430) for multi-label classification. DEM variants use regression to predict activity counts directly.
+
+## Configuration
+
+### Dataset Configuration
+
+Update paths in `configs/preset.py`:
+
+```python
+"path": {
+    "data_x": "/path/to/your/wifi_csi/amp",
+    "data_y": "/path/to/your/annotation.csv",
+    "save": "results/result.json"
+}
+```
+
+### Environment Selection
+
+Choose your experimental environment:
+
+```python
+"data": {
+    "environment": ["empty_room"],      # Options: "empty_room", "classroom", "meeting_room"
+    "wifi_band": ["5"],                 
+    "num_users": ["0","1","2","3","4","5"]
+}
+```
+
+### Model Hyperparameters
+
+Adjust neural network settings in the `nn` section:
+
+```python
+"nn": {
+    "lr": 5e-4,                        # Learning rate
+    "epoch": 300,                        # Number of epochs
+    "batch_size": 16,                  # Batch size
+    "num_obj_queries": 6,              # Number of object queries (for AMAR models)
+    "num_decoder_layers": 6,           # Decoder layers
+    "d_embedding": 64,                 # Embedding dimension
+    "n_layers_encoder": 4,             # Encoder layers
+    "n_attention_heads": 4,            # Attention heads
+    # ... more parameters
+}
+```
+
+
+## Project Organization
+
+### Source Code (`src/`)
+- **models/**: All model implementations with their forward passes and training functions
+- **data/**: Data loading, preprocessing, and dataset creation utilities
+- **utils.py**: Helper functions for metrics, visualization, and data manipulation
+- **train\*.py**: Training loop implementations for different model types
+
+### Scripts (`scripts/`)
+- Executable entry points for running experiments
+- Import from `src/` modules
+- Can be run from project root
+
+### Configuration (`configs/`)
+- All experimental settings and hyperparameters
+- Modify `preset.py` for different experiments
+- No hard-coded paths in source code
+
+### Results (`results/`)
+- **checkpoints/**: Trained model weights (.pth files)
+- **metrics/**: Performance metrics in JSON format
+- **figures/**: Generated visualizations and plots
+
+## Monitoring with Weights & Biases
+
+The project uses Weights & Biases (wandb) for experiment tracking:
+
+1. Login to wandb (first time only):
+```bash
+wandb login
+```
+
+2. Experiments are automatically logged during training
+3. View results at: https://wandb.ai/your-username/your-project
+
+## Output
+
+After running an experiment, you'll see:
+- Model architecture summary
+- Training progress with loss/metrics
+- Final results (Precision, Recall, F1-Score, Accuracy)
+- Results saved to `results/metrics/result.json`
+- Model checkpoints in `results/checkpoints/` (if `save_model: True`)
+

@@ -1,0 +1,1588 @@
+#
+##
+import os
+import math
+import time
+import torch
+import gc
+import numpy as np
+from sklearn.model_selection import train_test_split
+#
+import torch.nn as nn
+from torch.utils.data import TensorDataset
+from ptflops import get_model_complexity_info
+from src.models.modules.molecules import Backbone, Transformer_Encoder, TransformerDecoder
+from src.models.set_clustering import (visualize_query_clustering, matched_slot_points,
+                                       per_sample_padding_fraction, visualize_query_tsne_metadata)
+from src.models.that_variance import build_thatv, parse_backbone
+from src.models.checkpoints import save_amar_checkpoint
+from src.models.losses.supervised_loss import (HungarianMatchingLoss, SetDistillationLoss,
+                                               QuerySeparationLoss)
+from src.train import train
+from configs.preset import preset
+from src.utils import *
+import wandb
+
+
+
+
+class AMAR_WO_RVQ(nn.Module):
+    def __init__(self, var_x_shape, features_dim = 20, embedding_time_dim=100, num_decoder_layers=12,
+                 temp_cross=1, n_attention_heads=2, num_queries=5, dim_feedforward=1024, query_dropout_rate=0.0, num_classes=10):
+        super().__init__()
+        # self.feature_extractor = CNNFeatureExtractor(input_channels=var_x_shape[-1], output_channels=features_dim,embedding_time_dim=embedding_time_dim)
+      
+        var_backbone = preset["nn"].get("backbone", "default")
+        self.var_sequence_backbone, _ = parse_backbone(var_backbone)
+        if self.var_sequence_backbone:
+            self.feature_extractor = build_thatv(var_x_shape, [preset["nn"]["d_embedding"]], var_backbone)
+        else:
+            self.feature_extractor = Backbone(input_channels=var_x_shape[-1],
+                                              output_channels=preset["nn"]["d_embedding"])
+                                                     # embedding_time_dim=preset["cnn_embedding_time_dim"])
+
+        # self.encoder = Transformer_Encoder(var_embedding_shape, num_attention_heads=n_attention_heads,
+        #                                    num_transformer_encoder_layers=8)
+        self.encoder = Transformer_Encoder( d_model=preset["nn"]["d_embedding"], nhead=n_attention_heads, num_layers=preset["nn"]["n_layers_encoder"],
+                 max_total_tokens=preset["nn"]["token_length"])
+        self.decoder = TransformerDecoder(
+            d_model=features_dim,
+            nhead=n_attention_heads,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=0.1,
+            num_queries=num_queries,
+            temp_cross_attention=temp_cross, 
+            query_dropout_rate=query_dropout_rate,
+            num_classes= num_classes
+        )
+        self.decoder.memory_pos_encoding = self.encoder.pos_encoder
+    def forward(self, x, return_embedding=False):
+
+        if self.var_sequence_backbone:
+            extracted_features = self.feature_extractor.forward_sequence(x)
+        else:
+            extracted_features = self.feature_extractor(x)
+
+        memory = self.encoder(extracted_features)
+
+        ## return_embedding also hands back the last decoder layer's query embeddings, which
+        ## QuerySeparationLoss (src/models/losses/supervised_loss.py) contrasts by activity. It is
+        ## off by default so every other caller (evaluation, inference, visualisation) is unaffected.
+        if return_embedding:
+            return self.decoder(memory, return_embedding=True)
+
+        outputs_class = self.decoder(memory)
+
+        return outputs_class
+
+def run_AMAR_WO_RVQ(data_train_x,
+                     data_train_y,
+                     data_test_x,
+                     data_test_y,
+                     var_repeat=10, var_task = "activity", var_env = "empty_room", save_path = "./visualizations/temp"):
+    """
+    [description]
+    : run WiFi-based model Transformer_Encoder_DECODER
+    [parameter]
+    : data_train_x: numpy array, CSI amplitude to train model
+    : data_train_y: numpy array, labels to train model
+    : data_test_x: numpy array, CSI amplitude to test model
+    : data_test_y: numpy array, labels to test model
+    : var_repeat: int, number of repeated experiments
+    [return]
+    : result: dict, results of experiments
+    """
+    #
+    ##
+    ## ============================================ Preprocess ============================================
+    #
+    # Update device selection to check for CUDA first, then MPS (Apple Silicon), then CPU
+    device = select_device()
+    print(f"Using device: {device}")
+
+    data_valid_x, data_test_x, data_valid_y, data_test_y = train_test_split(data_test_x, data_test_y,
+                                                                            test_size=0.5,
+                                                                            shuffle=True,
+                                                                            random_state=39)
+    data_valid_x = data_valid_x.reshape(data_valid_x.shape[0], data_valid_x.shape[1], -1)
+    data_train_x = data_train_x.reshape(data_train_x.shape[0], data_train_x.shape[1], -1)
+    data_test_x = data_test_x.reshape(data_test_x.shape[0], data_test_x.shape[1], -1)
+    #
+    ## shape for model
+    var_x_shape = data_train_x[0].shape
+    #
+    data_train_set = TensorDataset(torch.from_numpy(data_train_x), torch.from_numpy(data_train_y))
+    data_valid_set = TensorDataset(torch.from_numpy(data_valid_x), torch.from_numpy(data_valid_y))
+
+    #
+    ##
+    ## ========================================= Train & Evaluate =========================================
+    result_accuracy = []
+    result_ppp = []
+    result_time_train = []
+    result_time_test = []
+    result_total_error = []
+    result_precision = []
+    result_recall = []
+    result_f1_score = []
+    result_avg_count_error = []
+
+    #
+    var_macs, var_params = get_model_complexity_info(AMAR_WO_RVQ(var_x_shape,
+                                n_attention_heads=preset["nn"]["n_attention_heads"],
+                                features_dim=preset["nn"]["d_embedding"],
+                                embedding_time_dim=preset["nn"]["token_length"],
+                                num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                                temp_cross=preset["nn"]["cross_attention_temp"],
+                                num_queries=preset["nn"]["num_obj_queries"],
+                                dim_feedforward=preset["nn"]["dim_FFN"],
+                                query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                                num_classes=preset["nn"]["num_classes"]),var_x_shape, as_strings=False)
+    print("Parameters:", var_params, "- FLOPs:", var_macs * 2)
+
+    #
+
+    for var_r in range(var_repeat):
+        #
+        ##
+        var_mode = "multi_head"
+        name_run = "Empty"
+        if preset["pretrained_path"]:
+            name_run = f"AMAR_{var_r}_" + "_".join(var_env) + "_" + preset["transfer_scenario"]
+        else:
+            pretrained_state = "NPT"
+            name_run = f"AMAR_{var_r}_" + "_".join(var_env) + "_" + pretrained_state 
+        print("Repeat", var_r)
+        run = wandb.init(
+            project="FINAL_AMAR",
+            name= name_run, 
+            config=preset,
+            reinit=True  
+        )
+        #
+        torch.random.manual_seed(var_r + 39)
+        #
+        model_AMAR_WO_RVQ = AMAR_WO_RVQ(var_x_shape,
+                            n_attention_heads=preset["nn"]["n_attention_heads"],
+                            features_dim=preset["nn"]["d_embedding"],
+                            embedding_time_dim=preset["nn"]["token_length"],
+                            num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                            temp_cross=preset["nn"]["cross_attention_temp"],
+                            num_queries=preset["nn"]["num_obj_queries"],
+                            dim_feedforward=preset["nn"]["dim_FFN"],
+                            # pca_embeddings=pca_components
+                            query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                            num_classes=preset["nn"]["num_classes"]
+                            ).to(device)
+        
+
+        model_AMAR_WO_RVQ.feature_extractor = torch.compile(model_AMAR_WO_RVQ.feature_extractor)
+
+
+        optimizer = torch.optim.Adam(model_AMAR_WO_RVQ.parameters(),
+                                        lr=preset["nn"]["lr"],
+                                        weight_decay=preset["nn"]["weight_decay"])
+
+        loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"]
+        )
+        var_time_0 = time.time()
+        #
+        ## ---------------------------------------- Train -----------------------------------------
+        #
+        var_best_weight = train(model=model_AMAR_WO_RVQ,
+                                optimizer=optimizer,
+                                loss=loss,
+                                data_train_set=data_train_set,
+                                data_valid_set=data_valid_set,
+                                var_threshold=preset["nn"]["threshold"],
+                                var_batch_size=preset["nn"]["batch_size"],
+                                var_epochs=preset["nn"]["epoch"],
+                                device=device,
+                                var_mode=var_mode)
+        # Save model components
+        if preset.get("save_model"):
+            save_model_components(preset, model_AMAR_WO_RVQ)
+        #
+        var_time_1 = time.time()
+        #
+
+
+        ## ---------------------------------------- Test ------------------------------------------
+        #
+        model_AMAR_WO_RVQ.load_state_dict(var_best_weight)
+        #
+        test_loader = torch.utils.data.DataLoader(
+            TensorDataset(torch.from_numpy(data_test_x), torch.from_numpy(data_test_y)),
+            batch_size=preset["nn"]["batch_size"], shuffle=False
+        )
+        preds = []
+        with torch.no_grad():
+            for xb, _ in test_loader:
+                preds.append(model_AMAR_WO_RVQ(xb.to(device)).cpu())
+        predict_test_y = torch.cat(preds, dim=1).numpy()
+        #
+        var_time_2 = time.time()
+        #
+        ## -------------------------------------- Evaluate ----------------------------------------
+        #
+        ##
+
+        layers_idxs = ["layer_"+str(i) for i in range(preset["nn"]["num_decoder_layers"])]
+        last_layer_only = True
+        # Store results for each layer
+        all_layers_results = {}
+        dict_layer_acc = performance_metrics(data_test_y, predict_test_y, var_mode=var_mode)
+
+        # Process each layer separately
+        for idx, layer_idx in enumerate(layers_idxs):
+            layer_metrics = dict_layer_acc[layer_idx]
+            if var_r == 0:  # Initialize lists on first repeat
+                result_ppp.append([])
+                result_time_train.append([])
+                result_time_test.append([])
+                result_total_error.append([])
+                result_precision.append([])
+                result_recall.append([])
+                result_f1_score.append([])
+                result_avg_count_error.append([])
+                result_accuracy.append([])
+            result_accuracy[idx].append(layer_metrics['accuracy'])
+            result_ppp[idx].append(layer_metrics['perfect_prediction_percentage'])
+            result_time_train[idx].append(var_time_1 - var_time_0)
+            result_time_test[idx].append(var_time_2 - var_time_1)
+            result_total_error[idx].append(layer_metrics['total_error'])
+            result_precision[idx].append(layer_metrics['precision'])
+            result_recall[idx].append(layer_metrics['recall'])
+            result_f1_score[idx].append(layer_metrics['f1_score'])
+            result_avg_count_error[idx].append(layer_metrics['mean_count_error'])
+
+        if last_layer_only:
+            layer_metrics = dict_layer_acc["layer_" +str(preset["nn"]["num_decoder_layers"] - 1)]
+            wandb.log({
+                f"test_results/repeat": var_r,
+                f"test_results/train_time": var_time_1 - var_time_0,
+                f"test_results/test_time": var_time_2 - var_time_1,
+                f"test_results/TOTAL_TESTSET_ERROR": layer_metrics['total_error'],
+                f"test_results/TOTAL_TESTSET_perfect_prediction_percentage": layer_metrics[
+                    'perfect_prediction_percentage'],
+                f"test_results/TOTAL_ACCURACY": layer_metrics['accuracy'],
+                f"test_results/mean_count_error": layer_metrics['mean_count_error'],
+                f"test_results/error_per_person_1": layer_metrics['error_per_person'][0],
+                f"test_results/error_per_person_2": layer_metrics['error_per_person'][1],
+                f"test_results/error_per_person_3": layer_metrics['error_per_person'][2],
+                f"test_results/error_per_person_4": layer_metrics['error_per_person'][3],
+                f"test_results/error_per_person_5": layer_metrics['error_per_person'][4],
+                f"test_results/precision": layer_metrics['precision'],
+                f"test_results/recall": layer_metrics['recall'],
+                f"test_results/f1_score": layer_metrics['f1_score']
+            }, step=var_r + 100000)
+
+            print(
+                  "- Total Error %.6f" % layer_metrics['total_error'],
+                  "- Perfect Prediction Percentage %.6f" % layer_metrics['perfect_prediction_percentage'])
+        
+        del optimizer, loss
+        torch.cuda.empty_cache()
+        gc.collect()
+        if var_r == var_repeat - 1:
+            last_model = model_AMAR_WO_RVQ   
+        else:
+            del model_AMAR_WO_RVQ
+    # Calculate averages and standard errors for each layer
+    for layer_idx_num, layer_idx in enumerate(layers_idxs):
+        # Calculate metrics with standard errors
+        ppp_array = np.array(result_ppp[layer_idx_num])
+        precision_array = np.array(result_precision[layer_idx_num])
+        recall_array = np.array(result_recall[layer_idx_num])
+        f1_array = np.array(result_f1_score[layer_idx_num])
+        accuracy_array = np.array(result_accuracy[layer_idx_num])
+        total_error_array = np.array(result_total_error[layer_idx_num])
+        
+        # Store results for this layer
+        all_layers_results[layer_idx] = {
+            'avg_PPP': float(np.mean(ppp_array)),
+            'avg_precision': float(np.mean(precision_array)),
+            'avg_recall': float(np.mean(recall_array)),
+            'avg_f1_score': float(np.mean(f1_array)),
+            'avg_accuracy': float(np.mean(accuracy_array)),
+            'avg_total_error': float(np.mean(total_error_array)),
+            'std_PPP': float(np.std(ppp_array, ddof=1)) if len(ppp_array) > 1 else 0.0,
+            'std_precision': float(np.std(precision_array, ddof=1)) if len(precision_array) > 1 else 0.0,
+            'std_recall': float(np.std(recall_array, ddof=1)) if len(recall_array) > 1 else 0.0,
+            'std_f1_score': float(np.std(f1_array, ddof=1)) if len(f1_array) > 1 else 0.0,
+            'std_accuracy': float(np.std(accuracy_array, ddof=1)) if len(accuracy_array) > 1 else 0.0,
+            'std_total_error': float(np.std(total_error_array, ddof=1)) if len(total_error_array) > 1 else 0.0,
+            'se_PPP': float(np.std(ppp_array, ddof=1) / np.sqrt(len(ppp_array))) if len(ppp_array) > 1 else 0.0,
+            'se_precision': float(np.std(precision_array, ddof=1) / np.sqrt(len(precision_array))) if len(precision_array) > 1 else 0.0,
+            'se_recall': float(np.std(recall_array, ddof=1) / np.sqrt(len(recall_array))) if len(recall_array) > 1 else 0.0,
+            'se_f1_score': float(np.std(f1_array, ddof=1) / np.sqrt(len(f1_array))) if len(f1_array) > 1 else 0.0,
+            'se_accuracy': float(np.std(accuracy_array, ddof=1) / np.sqrt(len(accuracy_array))) if len(accuracy_array) > 1 else 0.0,
+            'se_total_error': float(np.std(total_error_array, ddof=1) / np.sqrt(len(total_error_array))) if len(total_error_array) > 1 else 0.0
+        }
+        
+        wandb.log({
+            f"test_results/{layer_idx}/avg_PPP": all_layers_results[layer_idx]['avg_PPP'],
+            f"test_results/{layer_idx}/avg_train_time": sum(result_time_train[layer_idx_num]) / len(result_time_train[layer_idx_num]),
+            f"test_results/{layer_idx}/avg_test_time": sum(result_time_test[layer_idx_num]) / len(result_time_test[layer_idx_num]),
+            f"test_results/{layer_idx}/avg_total_error": all_layers_results[layer_idx]['avg_total_error'],
+            f"test_results/{layer_idx}/avg_precision": all_layers_results[layer_idx]['avg_precision'],
+            f"test_results/{layer_idx}/avg_recall": all_layers_results[layer_idx]['avg_recall'],
+            f"test_results/{layer_idx}/avg_f1_score": all_layers_results[layer_idx]['avg_f1_score'],
+            f"test_results/{layer_idx}/avg_count_error": sum(result_avg_count_error[layer_idx_num]) / len(result_avg_count_error[layer_idx_num]),
+            f"test_results/{layer_idx}/avg_accuracy": all_layers_results[layer_idx]['avg_accuracy']
+        })  # Use an even larger offset for averages
+    
+    # Use the last layer for visualization and final results
+    last_layer = layers_idxs[-1]
+    last_layer_predictions = predict_test_y[last_layer] if isinstance(predict_test_y, dict) else predict_test_y
+    # dict_true_acc = all_layers_results[last_layer]
+
+    # Run visualization with the last layer's predictions
+    
+    log_random_attention_weights_final(last_model, np.argmax(predict_test_y[-1], axis=-1), np.argmax(data_test_y, axis=-1), 1000000000, 50, var_task)
+    
+    viz_stats = visualize_model_performance(
+        y_pred=last_layer_predictions,
+        y_true=data_test_y,
+        var_mode=var_mode,
+        save_dir=save_path
+    )
+
+    wandb.finish()
+    return all_layers_results
+## ====================================================================================================================
+# CROSS DOMAIN 
+
+def run_cross_domain(train_sets_by_env, test_sets_by_env, var_repeat=10, var_task = "activity", var_env = "empty_room", save_path = "./visualizations/temp",
+                     var_class_names=None, var_location_positions=None, var_location_bounds=None):                    
+    """
+    [description]
+    : leave-one-room-out run of AMAR_WO_RVQ. Trains on every room in train_sets_by_env (each keeping
+      its own 90/10 validation split) and evaluates on every room in test_sets_by_env.
+    [parameter]
+    : train_sets_by_env: dict, env name -> (CSI amplitude, labels) of a training room
+    : test_sets_by_env: dict, env name -> (CSI amplitude, labels) of a held-out room
+    : var_repeat: int, number of repeated experiments
+    : var_class_names: activity names in class order, without the no-object class; when given, the
+      per-room clustering figure and the cross-room embedding-metadata figure are drawn beside the
+      confusion matrices, exactly as run_few_shot_cross_domain does (None = skip, e.g. the location task)
+    : var_location_positions: {room: {class index: (x, y) in meters}} of the location task's classes
+      (each room places a location letter differently); when given, every test room in it also gets the
+      true-against-predicted position scatter, so a run shows whether the positions transfer and not
+      only their per-location counts
+    : var_location_bounds: (x_min, x_max, y_min, y_max) in meters of the room frame that scatter uses
+    : return: dict, results of experiments
+    """
+    #
+    ##
+    ## ============================================ Preprocess ============================================
+    #
+    # Update device selection to check for CUDA first, then MPS (Apple Silicon), then CPU
+    device = select_device()
+    print(f"Using device: {device}")
+
+    ## Each training room keeps its CSI in place: torch.from_numpy shares the buffer and the 90/10
+    ## split is a Subset over indices, so a multi-room run costs no extra CSI memory beyond the rooms
+    ## themselves. Concatenating the rooms and letting train_test_split() copy the result would hold
+    ## several extra copies of ~12 GB/room and OOM the node -- the same reason
+    ## run_density_map_cross_domain uses this pattern.
+    var_train_datasets, var_valid_datasets = [], []
+    for var_env_name, (var_x_env, var_y_env) in train_sets_by_env.items():
+        var_x_env = np.asarray(var_x_env, dtype=np.float32).reshape(
+            var_x_env.shape[0], var_x_env.shape[1], -1)
+        var_y_env = np.asarray(var_y_env)
+        var_dataset = TensorDataset(torch.from_numpy(var_x_env), torch.from_numpy(var_y_env))
+        var_perm = np.random.RandomState(39).permutation(len(var_dataset))
+        var_num_valid = max(1, int(round(0.1 * len(var_dataset))))
+        var_valid_idx = np.sort(var_perm[:var_num_valid])
+        var_train_idx = np.sort(var_perm[var_num_valid:])
+        var_train_datasets.append(torch.utils.data.Subset(var_dataset, var_train_idx.tolist()))
+        var_valid_datasets.append(torch.utils.data.Subset(var_dataset, var_valid_idx.tolist()))
+    data_train_set = torch.utils.data.ConcatDataset(var_train_datasets)
+    data_valid_set = torch.utils.data.ConcatDataset(var_valid_datasets)
+    var_x_shape = tuple(var_train_datasets[0].dataset.tensors[0].shape[1:])
+
+    #
+    ##
+    ## ========================================= Train & Evaluate =========================================
+    ## per env results 
+    env_result_accuracy = {}
+    env_result_total_error = {}
+    env_result_ppp = {}
+    env_result_precision = {}
+    env_result_recall = {}
+    env_result_f1_score = {}
+    env_result_micro_f1 = {}
+    env_result_present_f1 = {}
+    env_result_present_recall = {}
+    env_predict_y_last = {} 
+
+    #
+    var_macs, var_params = get_model_complexity_info(AMAR_WO_RVQ(var_x_shape,
+                                n_attention_heads=preset["nn"]["n_attention_heads"],
+                                features_dim=preset["nn"]["d_embedding"],
+                                embedding_time_dim=preset["nn"]["token_length"],
+                                num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                                temp_cross=preset["nn"]["cross_attention_temp"],
+                                num_queries=preset["nn"]["num_obj_queries"],
+                                dim_feedforward=preset["nn"]["dim_FFN"],
+                                query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                                num_classes=preset["nn"]["num_classes"]),var_x_shape, as_strings=False)
+    print("Parameters:", var_params, "- FLOPs:", var_macs * 2)
+
+    #
+
+    for var_r in range(var_repeat):
+        #
+        ##
+        var_mode = "multi_head"
+        name_run = "Empty"
+        if preset["pretrained_path"]:
+            name_run = f"AMAR_{var_r}_" + "_".join(var_env) + "_" + preset["transfer_scenario"]
+        else:
+            pretrained_state = "NPT"
+            name_run = f"AMAR_{var_r}_" + "_".join(var_env) + "_" + pretrained_state 
+        print("Repeat", var_r)
+        run = wandb.init(
+            project="FINAL_AMAR",
+            name= name_run, 
+            config=preset,
+            reinit=True  
+        )
+        #
+        torch.random.manual_seed(var_r + 39)
+        #
+        model_AMAR_WO_RVQ = AMAR_WO_RVQ(var_x_shape,
+                            n_attention_heads=preset["nn"]["n_attention_heads"],
+                            features_dim=preset["nn"]["d_embedding"],
+                            embedding_time_dim=preset["nn"]["token_length"],
+                            num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                            temp_cross=preset["nn"]["cross_attention_temp"],
+                            num_queries=preset["nn"]["num_obj_queries"],
+                            dim_feedforward=preset["nn"]["dim_FFN"],
+                            # pca_embeddings=pca_components
+                            query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                            num_classes=preset["nn"]["num_classes"]
+                            ).to(device)
+        
+
+        model_AMAR_WO_RVQ.feature_extractor = torch.compile(model_AMAR_WO_RVQ.feature_extractor)
+
+
+        optimizer = torch.optim.Adam(model_AMAR_WO_RVQ.parameters(),
+                                        lr=preset["nn"]["lr"],
+                                        weight_decay=preset["nn"]["weight_decay"])
+
+        loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"]
+        )
+        var_time_0 = time.time()
+        #
+        ## ---------------------------------------- Train -----------------------------------------
+        #
+        var_best_weight = train(model=model_AMAR_WO_RVQ,
+                                optimizer=optimizer,
+                                loss=loss,
+                                data_train_set=data_train_set,
+                                data_valid_set=data_valid_set,
+                                var_threshold=preset["nn"]["threshold"],
+                                var_batch_size=preset["nn"]["batch_size"],
+                                var_epochs=preset["nn"]["epoch"],
+                                device=device,
+                                var_mode=var_mode)
+        # Save model components
+        if preset.get("save_model"):
+            save_model_components(preset, model_AMAR_WO_RVQ)
+        #
+        var_time_1 = time.time()
+  
+        ## -------------------------------------- Test and Evaluate ----------------------------------------
+        model_AMAR_WO_RVQ.load_state_dict(var_best_weight)
+
+        var_time_2 = time.time()
+        # Per-env evaluation: 
+        if test_sets_by_env:
+            for env_name, (X_env, y_env) in test_sets_by_env.items():
+                X_env_reshaped = X_env.reshape(X_env.shape[0], X_env.shape[1], -1)
+                env_loader = torch.utils.data.DataLoader(
+                    TensorDataset(torch.from_numpy(X_env_reshaped), torch.from_numpy(y_env)),
+                    batch_size=preset["nn"]["batch_size"], shuffle=False
+                )
+                env_preds = []
+                with torch.no_grad():
+                    for xb, _ in env_loader:
+                        env_preds.append(model_AMAR_WO_RVQ(xb.to(device)).cpu())
+                env_predict_y = torch.cat(env_preds, dim=1).numpy()
+                env_predict_y_last[env_name] = env_predict_y
+                env_metrics = performance_metrics(y_env, env_predict_y, var_mode=var_mode)
+                env_last_layer = env_metrics["layer_" + str(preset["nn"]["num_decoder_layers"] - 1)]
+                # Initialize this env's lists on first sighting
+                if env_name not in env_result_accuracy:
+                    env_result_accuracy[env_name] = []
+                    env_result_total_error[env_name] = []
+                    env_result_ppp[env_name] = []
+                    env_result_precision[env_name] = []
+                    env_result_recall[env_name] = []
+                    env_result_f1_score[env_name] = []
+                    env_result_micro_f1[env_name] = []
+                    env_result_present_f1[env_name] = []
+                    env_result_present_recall[env_name] = []
+
+                env_result_accuracy[env_name].append(env_last_layer['accuracy'])
+                env_result_total_error[env_name].append(env_last_layer['total_error'])
+                env_result_ppp[env_name].append(env_last_layer['perfect_prediction_percentage'])
+                env_result_precision[env_name].append(env_last_layer['precision'])
+                env_result_recall[env_name].append(env_last_layer['recall'])
+                env_result_f1_score[env_name].append(env_last_layer['f1_score'])
+                env_result_micro_f1[env_name].append(env_last_layer['micro_f1'])
+                env_result_present_f1[env_name].append(env_last_layer['present_f1'])
+                env_result_present_recall[env_name].append(env_last_layer['present_recall'])
+
+                wandb.log({
+                    f"test_results_per_env/{env_name}/accuracy": env_last_layer['accuracy'],
+                    f"test_results_per_env/{env_name}/total_error": env_last_layer['total_error'],
+                    f"test_results_per_env/{env_name}/perfect_prediction_percentage": env_last_layer['perfect_prediction_percentage'],
+                    f"test_results_per_env/{env_name}/precision": env_last_layer['precision'],
+                    f"test_results_per_env/{env_name}/recall": env_last_layer['recall'],
+                    f"test_results_per_env/{env_name}/f1_score": env_last_layer['f1_score'],
+                    f"test_results_per_env/{env_name}/micro_f1": env_last_layer['micro_f1'],
+                    f"test_results_per_env/{env_name}/present_f1": env_last_layer['present_f1'],
+                }, step=var_r + 100000)
+
+                print(f"  [{env_name}] Total Error: {env_last_layer['total_error']:.6f} "
+                        f"| Perfect Prediction %: {env_last_layer['perfect_prediction_percentage']:.6f}")
+        del optimizer, loss
+        torch.cuda.empty_cache()
+        gc.collect()
+        if var_r == var_repeat - 1:
+            last_model = model_AMAR_WO_RVQ   
+        else:
+            del model_AMAR_WO_RVQ
+
+    ## keep the last repeat's weights so the run can be diagnosed / re-evaluated without retraining
+    save_amar_checkpoint(last_model, var_x_shape, list(train_sets_by_env), save_path)
+
+    all_envs_results = {}
+    for env_name in env_result_accuracy.keys():
+        acc_arr = np.array(env_result_accuracy[env_name])
+        err_arr = np.array(env_result_total_error[env_name])
+        ppp_arr = np.array(env_result_ppp[env_name])
+        prec_arr = np.array(env_result_precision[env_name])
+        rec_arr = np.array(env_result_recall[env_name])
+        f1_arr = np.array(env_result_f1_score[env_name])
+        micro_f1_arr = np.array(env_result_micro_f1[env_name])
+        present_f1_arr = np.array(env_result_present_f1[env_name])
+        present_recall_arr = np.array(env_result_present_recall[env_name])
+
+        def _mean_std_se(arr):
+            mean = float(np.mean(arr))
+            std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            se = float(std / np.sqrt(len(arr))) if len(arr) > 1 else 0.0
+            return mean, std, se
+
+        acc_mean, acc_std, acc_se = _mean_std_se(acc_arr)
+        err_mean, err_std, err_se = _mean_std_se(err_arr)
+        ppp_mean, ppp_std, ppp_se = _mean_std_se(ppp_arr)
+        prec_mean, prec_std, prec_se = _mean_std_se(prec_arr)
+        rec_mean, rec_std, rec_se = _mean_std_se(rec_arr)
+        f1_mean, f1_std, f1_se = _mean_std_se(f1_arr)
+        micro_f1_mean, micro_f1_std, micro_f1_se = _mean_std_se(micro_f1_arr)
+        present_f1_mean, present_f1_std, present_f1_se = _mean_std_se(present_f1_arr)
+        present_recall_mean, present_recall_std, present_recall_se = _mean_std_se(present_recall_arr)
+
+        all_envs_results[env_name] = {
+            'avg_accuracy': acc_mean, 'std_accuracy': acc_std, 'se_accuracy': acc_se,
+            'avg_total_error': err_mean, 'std_total_error': err_std, 'se_total_error': err_se,
+            'avg_PPP': ppp_mean, 'std_PPP': ppp_std, 'se_PPP': ppp_se,
+            'avg_precision': prec_mean, 'std_precision': prec_std, 'se_precision': prec_se,
+            'avg_recall': rec_mean, 'std_recall': rec_std, 'se_recall': rec_se,
+            'avg_f1_score': f1_mean, 'std_f1_score': f1_std, 'se_f1_score': f1_se,
+            'avg_micro_f1': micro_f1_mean, 'std_micro_f1': micro_f1_std, 'se_micro_f1': micro_f1_se,
+            'avg_present_f1': present_f1_mean, 'std_present_f1': present_f1_std,
+            'se_present_f1': present_f1_se,
+            'avg_present_recall': present_recall_mean, 'std_present_recall': present_recall_std,
+            'se_present_recall': present_recall_se,
+        } 
+    ## {field: [per-environment arrays]}, the cross-room embedding-metadata figure's input, filled
+    ## below when class names are given
+    var_meta_collect = {var_field: [] for var_field in ("points", "activity", "room", "split",
+                                                        "occupants", "padding")}
+    ## how many training frames mark each location class, the weight of the constant baseline below.
+    ## Only the labels are touched, so a LazyRoomArray source is not materialized for this.
+    var_location_counts = None
+    if var_location_positions is not None:
+        var_train_labels = [np.asarray(var_y_env) for _, var_y_env in train_sets_by_env.values()]
+        var_location_counts = (np.concatenate(var_train_labels, axis=0).sum(axis=1) > 0).sum(axis=0)
+    for env_name, (X_env, y_env) in test_sets_by_env.items():
+        if env_name not in env_predict_y_last:
+            continue
+        viz_stats = visualize_model_performance(
+            y_pred=env_predict_y_last[env_name],
+            y_true=y_env,
+            var_mode=var_mode,
+            save_dir=os.path.join(save_path, env_name)
+        )
+        if var_location_positions is not None and env_name in var_location_positions:
+            ## the spatial view of the same frames: the last decoder layer's predicted locations
+            ## against the true ones, in this room's own layout (each room places a letter differently),
+            ## plus the constant baseline the model has to beat
+            var_room_positions = var_location_positions[env_name]
+            visualize_location_position_scatter(
+                location_label_positions(y_env, var_room_positions, var_mode="sets"),
+                location_label_positions(env_predict_y_last[env_name][-1], var_room_positions,
+                                         var_mode="sets"),
+                env_name, os.path.join(save_path, env_name), var_location_bounds,
+                var_const_pos=location_mean_position(var_location_counts, var_room_positions),
+                var_const_label="constant (mean training location)",
+                var_prior_pos=location_prior_positions(var_location_counts, var_room_positions),
+                var_prior_label="training prior (training locations)")
+        if var_class_names is not None:
+            ## the same per-room clustering figure run_few_shot_cross_domain draws, off the last
+            ## repeat's model (kept above) and the frames the confusion matrices just used
+            var_x_env = X_env.reshape(X_env.shape[0], X_env.shape[1], -1)
+            all_envs_results[env_name]["clustering"] = visualize_query_clustering(
+                last_model, var_x_env, y_env, var_class_names,
+                save_path=os.path.join(save_path, env_name),
+                var_model_name=f"model_r{var_repeat - 1}")
+            ## the same matched-slot points, kept so the cross-room figure below can colour them by
+            ## room / split / occupancy as well as activity
+            var_points, var_act, _, var_matched = matched_slot_points(
+                last_model, var_x_env, y_env, var_batch_size=preset["nn"]["batch_size"],
+                var_device=device)
+            ## occupant count per frame: the target slots that are not the no-object class
+            var_y_arr = np.asarray(y_env)
+            var_occupants = (var_y_arr.argmax(-1) != var_y_arr.shape[-1] - 1).sum(axis=1)
+            var_meta_collect["points"].append(var_points)
+            var_meta_collect["activity"].append(var_act)
+            var_meta_collect["room"].append(np.full(len(var_points), env_name))
+            var_meta_collect["split"].append(np.full(
+                len(var_points), "synth" if env_name.endswith("_synth") else "real"))
+            var_meta_collect["occupants"].append(var_occupants[var_matched])
+            var_meta_collect["padding"].append(per_sample_padding_fraction(
+                var_x_env, np.arange(len(var_x_env)))[var_matched])
+        stats = all_envs_results[env_name]
+        ## micro-F1 / present-F1 are the class-absence-free readouts; 'accuracy' sits near (C-2)/C
+        ## on a single-occupant task whatever the model does (see calculate_scores)
+        print(f"\n[{env_name}] avg over {var_repeat} repeats: "
+            f"micro-F1 {stats['avg_micro_f1']:.4f} ± {stats['se_micro_f1']:.4f} | "
+            f"present-F1 {stats['avg_present_f1']:.4f} ± {stats['se_present_f1']:.4f} | "
+            f"PPP {stats['avg_PPP']:.4f} ± {stats['se_PPP']:.4f} | "
+            f"Total Error {stats['avg_total_error']:.4f} ± {stats['se_total_error']:.4f} | "
+            f"(TN-inflated Accuracy {stats['avg_accuracy']:.4f}, F1 {stats['avg_f1_score']:.4f})")
+    if var_class_names is not None and var_meta_collect["points"]:
+        ## one figure over every test room at once: the single-room t-SNE cannot show whether the
+        ## embedding separates rooms or domains rather than activities
+        var_meta = {var_field: np.concatenate(var_values)
+                    for var_field, var_values in var_meta_collect.items()
+                    if var_field not in ("points", "activity")}
+        var_meta_summary = visualize_query_tsne_metadata(
+            np.concatenate(var_meta_collect["points"]),
+            np.concatenate(var_meta_collect["activity"]),
+            var_class_names, var_meta, save_path, f"model_r{var_repeat - 1}")
+        print(f"  [model] embedding metadata separation: " + " | ".join(
+            f"{var_field} kNN-purity {var_info['knn_purity']:.2f} vs chance {var_info['chance']:.2f}"
+            for var_field, var_info in var_meta_summary.items() if isinstance(var_info, dict)))
+    wandb.finish()
+    return all_envs_results
+
+def run_t2t1(data_train_x,
+                     data_train_y,
+                     data_test_x,
+                     data_test_y,
+                     var_repeat=10, var_task = "activity", var_env = "empty_room", save_path = "./visualizations/temp"):
+    """
+    [description]
+    : run WiFi-based model Transformer_Encoder_DECODER
+    [parameter]
+    : data_train_x: numpy array, CSI amplitude to train model
+    : data_train_y: numpy array, labels to train model
+    : data_test_x: numpy array, CSI amplitude to test model
+    : data_test_y: numpy array, labels to test model
+    : var_repeat: int, number of repeated experiments
+    [return]
+    : result: dict, results of experiments
+    """
+    #
+    ##
+    ## ============================================ Preprocess ============================================
+    #
+    device = select_device()
+    print(f"Using device: {device}")
+
+    data_train_x, data_valid_x, data_train_y, data_valid_y = train_test_split(
+        data_train_x, data_train_y,
+        test_size=0.1, 
+        shuffle=True,
+        random_state=39
+    )
+    data_valid_x = data_valid_x.reshape(data_valid_x.shape[0], data_valid_x.shape[1], -1)
+    data_train_x = data_train_x.reshape(data_train_x.shape[0], data_train_x.shape[1], -1)
+    var_x_shape = data_train_x[0].shape
+
+    data_train_set = TensorDataset(torch.from_numpy(data_train_x), torch.from_numpy(data_train_y))
+    data_valid_set = TensorDataset(torch.from_numpy(data_valid_x), torch.from_numpy(data_valid_y))
+    data_test_x = data_test_x.reshape(data_test_x.shape[0], data_test_x.shape[1], -1) 
+    #
+    ##
+    ## ========================================= Train & Evaluate =========================================
+    result_accuracy = []
+    result_ppp = []
+    result_time_train = []
+    result_time_test = []
+    result_total_error = []
+    result_precision = []
+    result_recall = []
+    result_f1_score = []
+    result_avg_count_error = []
+
+    #
+    var_macs, var_params = get_model_complexity_info(AMAR_WO_RVQ(var_x_shape,
+                                n_attention_heads=preset["nn"]["n_attention_heads"],
+                                features_dim=preset["nn"]["d_embedding"],
+                                embedding_time_dim=preset["nn"]["token_length"],
+                                num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                                temp_cross=preset["nn"]["cross_attention_temp"],
+                                num_queries=preset["nn"]["num_obj_queries"],
+                                dim_feedforward=preset["nn"]["dim_FFN"],
+                                query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                                num_classes=preset["nn"]["num_classes"]),var_x_shape, as_strings=False)
+    print("Parameters:", var_params, "- FLOPs:", var_macs * 2)
+
+    #
+
+    for var_r in range(var_repeat):
+        #
+        ##
+        var_mode = "multi_head"
+        name_run = "Empty"
+        if preset["pretrained_path"]:
+            name_run = f"AMAR_{var_r}_" + "_".join(var_env) + "_" + preset["transfer_scenario"]
+        else:
+            pretrained_state = "NPT"
+            name_run = f"AMAR_{var_r}_" + "_".join(var_env) + "_" + pretrained_state 
+        print("Repeat", var_r)
+        run = wandb.init(
+            project="FINAL_AMAR",
+            name= name_run, 
+            config=preset,
+            reinit=True  
+        )
+        #
+        torch.random.manual_seed(var_r + 39)
+        #
+        model_AMAR_WO_RVQ = AMAR_WO_RVQ(var_x_shape,
+                            n_attention_heads=preset["nn"]["n_attention_heads"],
+                            features_dim=preset["nn"]["d_embedding"],
+                            embedding_time_dim=preset["nn"]["token_length"],
+                            num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                            temp_cross=preset["nn"]["cross_attention_temp"],
+                            num_queries=preset["nn"]["num_obj_queries"],
+                            dim_feedforward=preset["nn"]["dim_FFN"],
+                            query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                            num_classes=preset["nn"]["num_classes"]
+                            ).to(device)
+        
+
+        model_AMAR_WO_RVQ.feature_extractor = torch.compile(model_AMAR_WO_RVQ.feature_extractor)
+
+
+        optimizer = torch.optim.Adam(model_AMAR_WO_RVQ.parameters(),
+                                        lr=preset["nn"]["lr"],
+                                        weight_decay=preset["nn"]["weight_decay"])
+
+        loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"]
+        )
+        var_time_0 = time.time()
+        #
+        ## ---------------------------------------- Train -----------------------------------------
+        #
+        var_best_weight = train(model=model_AMAR_WO_RVQ,
+                                optimizer=optimizer,
+                                loss=loss,
+                                data_train_set=data_train_set,
+                                data_valid_set=data_valid_set,
+                                var_threshold=preset["nn"]["threshold"],
+                                var_batch_size=preset["nn"]["batch_size"],
+                                var_epochs=preset["nn"]["epoch"],
+                                device=device,
+                                var_mode=var_mode)
+        # Save model components
+        if preset.get("save_model"):
+            save_model_components(preset, model_AMAR_WO_RVQ)
+        #
+        var_time_1 = time.time()
+        #
+
+
+        ## ---------------------------------------- Test ------------------------------------------
+        #
+        model_AMAR_WO_RVQ.load_state_dict(var_best_weight)
+        #
+        test_loader = torch.utils.data.DataLoader(
+            TensorDataset(torch.from_numpy(data_test_x), torch.from_numpy(data_test_y)),
+            batch_size=preset["nn"]["batch_size"], shuffle=False
+        )
+        preds = []
+        with torch.no_grad():
+            for xb, _ in test_loader:
+                preds.append(model_AMAR_WO_RVQ(xb.to(device)).cpu())
+        predict_test_y = torch.cat(preds, dim=1).numpy()
+        #
+        var_time_2 = time.time()
+        #
+        ## -------------------------------------- Evaluate ----------------------------------------
+        #
+        ##
+
+        layers_idxs = ["layer_"+str(i) for i in range(preset["nn"]["num_decoder_layers"])]
+        last_layer_only = True
+        # Store results for each layer
+        all_layers_results = {}
+        dict_layer_acc = performance_metrics(data_test_y, predict_test_y, var_mode=var_mode)
+
+        # Process each layer separately
+        for idx, layer_idx in enumerate(layers_idxs):
+            layer_metrics = dict_layer_acc[layer_idx]
+            if var_r == 0:  # Initialize lists on first repeat
+                result_ppp.append([])
+                result_time_train.append([])
+                result_time_test.append([])
+                result_total_error.append([])
+                result_precision.append([])
+                result_recall.append([])
+                result_f1_score.append([])
+                result_avg_count_error.append([])
+                result_accuracy.append([])
+            result_accuracy[idx].append(layer_metrics['accuracy'])
+            result_ppp[idx].append(layer_metrics['perfect_prediction_percentage'])
+            result_time_train[idx].append(var_time_1 - var_time_0)
+            result_time_test[idx].append(var_time_2 - var_time_1)
+            result_total_error[idx].append(layer_metrics['total_error'])
+            result_precision[idx].append(layer_metrics['precision'])
+            result_recall[idx].append(layer_metrics['recall'])
+            result_f1_score[idx].append(layer_metrics['f1_score'])
+            result_avg_count_error[idx].append(layer_metrics['mean_count_error'])
+
+        if last_layer_only:
+            layer_metrics = dict_layer_acc["layer_" +str(preset["nn"]["num_decoder_layers"] - 1)]
+            wandb.log({
+                f"test_results/repeat": var_r,
+                f"test_results/train_time": var_time_1 - var_time_0,
+                f"test_results/test_time": var_time_2 - var_time_1,
+                f"test_results/TOTAL_TESTSET_ERROR": layer_metrics['total_error'],
+                f"test_results/TOTAL_TESTSET_perfect_prediction_percentage": layer_metrics[
+                    'perfect_prediction_percentage'],
+                f"test_results/TOTAL_ACCURACY": layer_metrics['accuracy'],
+                f"test_results/mean_count_error": layer_metrics['mean_count_error'],
+                f"test_results/error_per_person_1": layer_metrics['error_per_person'][0],
+                f"test_results/error_per_person_2": layer_metrics['error_per_person'][1],
+                f"test_results/error_per_person_3": layer_metrics['error_per_person'][2],
+                f"test_results/error_per_person_4": layer_metrics['error_per_person'][3],
+                f"test_results/error_per_person_5": layer_metrics['error_per_person'][4],
+                f"test_results/precision": layer_metrics['precision'],
+                f"test_results/recall": layer_metrics['recall'],
+                f"test_results/f1_score": layer_metrics['f1_score']
+            }, step=var_r + 100000)
+
+            print(
+                  "- Total Error %.6f" % layer_metrics['total_error'],
+                  "- Perfect Prediction Percentage %.6f" % layer_metrics['perfect_prediction_percentage'])
+        
+        del optimizer, loss, var_best_weight, test_loader, preds, dict_layer_acc
+        torch.cuda.empty_cache()
+        gc.collect()
+        if var_r == var_repeat - 1:
+            last_model = model_AMAR_WO_RVQ   
+        else:
+            del model_AMAR_WO_RVQ
+    # Calculate averages and standard errors for each layer
+    for layer_idx_num, layer_idx in enumerate(layers_idxs):
+        # Calculate metrics with standard errors
+        ppp_array = np.array(result_ppp[layer_idx_num])
+        precision_array = np.array(result_precision[layer_idx_num])
+        recall_array = np.array(result_recall[layer_idx_num])
+        f1_array = np.array(result_f1_score[layer_idx_num])
+        accuracy_array = np.array(result_accuracy[layer_idx_num])
+        total_error_array = np.array(result_total_error[layer_idx_num])
+        
+        # Store results for this layer
+        all_layers_results[layer_idx] = {
+            'avg_PPP': float(np.mean(ppp_array)),
+            'avg_precision': float(np.mean(precision_array)),
+            'avg_recall': float(np.mean(recall_array)),
+            'avg_f1_score': float(np.mean(f1_array)),
+            'avg_accuracy': float(np.mean(accuracy_array)),
+            'avg_total_error': float(np.mean(total_error_array)),
+            'std_PPP': float(np.std(ppp_array, ddof=1)) if len(ppp_array) > 1 else 0.0,
+            'std_precision': float(np.std(precision_array, ddof=1)) if len(precision_array) > 1 else 0.0,
+            'std_recall': float(np.std(recall_array, ddof=1)) if len(recall_array) > 1 else 0.0,
+            'std_f1_score': float(np.std(f1_array, ddof=1)) if len(f1_array) > 1 else 0.0,
+            'std_accuracy': float(np.std(accuracy_array, ddof=1)) if len(accuracy_array) > 1 else 0.0,
+            'std_total_error': float(np.std(total_error_array, ddof=1)) if len(total_error_array) > 1 else 0.0,
+            'se_PPP': float(np.std(ppp_array, ddof=1) / np.sqrt(len(ppp_array))) if len(ppp_array) > 1 else 0.0,
+            'se_precision': float(np.std(precision_array, ddof=1) / np.sqrt(len(precision_array))) if len(precision_array) > 1 else 0.0,
+            'se_recall': float(np.std(recall_array, ddof=1) / np.sqrt(len(recall_array))) if len(recall_array) > 1 else 0.0,
+            'se_f1_score': float(np.std(f1_array, ddof=1) / np.sqrt(len(f1_array))) if len(f1_array) > 1 else 0.0,
+            'se_accuracy': float(np.std(accuracy_array, ddof=1) / np.sqrt(len(accuracy_array))) if len(accuracy_array) > 1 else 0.0,
+            'se_total_error': float(np.std(total_error_array, ddof=1) / np.sqrt(len(total_error_array))) if len(total_error_array) > 1 else 0.0
+        }
+        
+        wandb.log({
+            f"test_results/{layer_idx}/avg_PPP": all_layers_results[layer_idx]['avg_PPP'],
+            f"test_results/{layer_idx}/avg_train_time": sum(result_time_train[layer_idx_num]) / len(result_time_train[layer_idx_num]),
+            f"test_results/{layer_idx}/avg_test_time": sum(result_time_test[layer_idx_num]) / len(result_time_test[layer_idx_num]),
+            f"test_results/{layer_idx}/avg_total_error": all_layers_results[layer_idx]['avg_total_error'],
+            f"test_results/{layer_idx}/avg_precision": all_layers_results[layer_idx]['avg_precision'],
+            f"test_results/{layer_idx}/avg_recall": all_layers_results[layer_idx]['avg_recall'],
+            f"test_results/{layer_idx}/avg_f1_score": all_layers_results[layer_idx]['avg_f1_score'],
+            f"test_results/{layer_idx}/avg_count_error": sum(result_avg_count_error[layer_idx_num]) / len(result_avg_count_error[layer_idx_num]),
+            f"test_results/{layer_idx}/avg_accuracy": all_layers_results[layer_idx]['avg_accuracy']
+        })  # Use an even larger offset for averages
+    
+    # Use the last layer for visualization and final results
+    last_layer = layers_idxs[-1]
+    last_layer_predictions = predict_test_y[last_layer] if isinstance(predict_test_y, dict) else predict_test_y
+
+    # Run visualization with the last layer's predictions
+    
+    log_random_attention_weights_final(last_model, np.argmax(predict_test_y[-1], axis=-1), np.argmax(data_test_y, axis=-1), 1000000000, 50, var_task)
+    
+    viz_stats = visualize_model_performance(
+        y_pred=last_layer_predictions,
+        y_true=data_test_y,
+        var_mode=var_mode,
+        save_dir=save_path
+    )
+
+    wandb.finish()
+    return all_layers_results
+## ====================================================================================================================
+# FEW-SHOT KNOWLEDGE DISTILLATION
+def _build_amar_wo_rvq(var_x_shape, device):
+    """Instantiate AMAR_WO_RVQ with the preset hyperparameters."""
+    return AMAR_WO_RVQ(var_x_shape,
+                       n_attention_heads=preset["nn"]["n_attention_heads"],
+                       features_dim=preset["nn"]["d_embedding"],
+                       embedding_time_dim=preset["nn"]["token_length"],
+                       num_decoder_layers=preset["nn"]["num_decoder_layers"],
+                       temp_cross=preset["nn"]["cross_attention_temp"],
+                       num_queries=preset["nn"]["num_obj_queries"],
+                       dim_feedforward=preset["nn"]["dim_FFN"],
+                       query_dropout_rate=preset["nn"]["query_dropout_rate"],
+                       num_classes=preset["nn"]["num_classes"]).to(device)
+
+
+def _mean_std_se(arr):
+    """Mean, sample std and standard error over the repeats."""
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+    se = float(std / np.sqrt(len(arr))) if len(arr) > 1 else 0.0
+    return mean, std, se
+
+
+def run_AMAR_WO_RVQ_few_shot(data_train_x,
+                             data_train_y,
+                             test_sets_by_env,
+                             var_few_shot_ratio=0.01,
+                             var_kd_weight=1.0,
+                             var_kd_temperature=1.0,
+                             var_teacher_epochs=None,
+                             var_student_epochs=None,
+                             var_compile=True,
+                             var_repeat=10, var_task="activity", var_env="empty_room",
+                             save_path="./visualizations/temp"):
+    """
+    [description]
+    : Few-shot knowledge distillation for AMAR_WO_RVQ trained on a single environment and tested on
+      the others.
+    : data_train_x: numpy array, CSI amplitude of the single training environment
+    : data_train_y: numpy array, labels of the training environment
+    : test_sets_by_env: dict, {env_name: (X, y)} test sets of the other environments
+    : var_few_shot_ratio: float, fraction of the training environment used to train the student
+    : var_kd_weight: float, weight of the distillation term
+    : var_kd_temperature: float, temperature of the distillation soft targets
+    : var_teacher_epochs: int, teacher training epochs (defaults to preset["nn"]["epoch"])
+    : var_student_epochs: int, student training epochs (defaults to preset["nn"]["epoch"])
+    : var_compile: bool, torch.compile both feature extractors
+    : var_repeat: int, number of repeated experiments
+    : var_env: str or list, training environment name(s) used for the run name
+    : save_path: str, directory for visualizations (one sub-directory per test environment)
+    [return]
+    : all_envs_results: dict, per-environment averaged metrics
+    """
+    device = select_device()
+    print(f"Using device: {device}")
+
+    if var_teacher_epochs is None:
+        var_teacher_epochs = preset["nn"]["epoch"]
+    if var_student_epochs is None:
+        var_student_epochs = preset["nn"]["epoch"]
+    env_name = var_env if isinstance(var_env, str) else "_".join(var_env)
+
+    #
+    ## ============================================ Preprocess ============================================
+    #
+    data_train_x = data_train_x.reshape(data_train_x.shape[0], data_train_x.shape[1], -1)
+    var_x_shape = data_train_x[0].shape
+
+    num_train = data_train_x.shape[0]
+    num_few = max(1, int(round(var_few_shot_ratio * num_train)))
+    if num_few >= num_train - 1:
+        raise ValueError(
+            f"var_few_shot_ratio={var_few_shot_ratio} leaves no validation data "
+            f"({num_few}/{num_train} training-environment samples). Lower the ratio or provide more data."
+        )
+    shuffle_idx = np.random.RandomState(39).permutation(num_train)
+    few_idx = shuffle_idx[:num_few]
+    rest_idx = shuffle_idx[num_few:]
+    num_valid = max(1, int(round(0.1 * rest_idx.shape[0])))
+    valid_idx = rest_idx[:num_valid]
+    teacher_idx = rest_idx[num_valid:]
+
+    data_few_x, data_few_y = data_train_x[few_idx], data_train_y[few_idx]
+    data_teacher_valid_x, data_teacher_valid_y = data_train_x[valid_idx], data_train_y[valid_idx]
+    data_teacher_x, data_teacher_y = data_train_x[teacher_idx], data_train_y[teacher_idx]
+
+    teacher_train_set = TensorDataset(torch.from_numpy(data_teacher_x), torch.from_numpy(data_teacher_y))
+    teacher_valid_set = TensorDataset(torch.from_numpy(data_teacher_valid_x), torch.from_numpy(data_teacher_valid_y))
+    student_train_set = TensorDataset(torch.from_numpy(data_few_x), torch.from_numpy(data_few_y))
+    student_valid_set = TensorDataset(torch.from_numpy(data_teacher_valid_x), torch.from_numpy(data_teacher_valid_y))
+    print(f"Training environment [{env_name}] - teacher train {data_teacher_x.shape[0]} | "
+          f"student few-shot train {num_few}/{num_train} ({var_few_shot_ratio:.2%}) | "
+          f"student validation {data_teacher_valid_x.shape[0]}")
+    print(f"Test environments: {list(test_sets_by_env.keys())}")
+
+    #
+    ## ---------------------------------------- Complexity ----------------------------------------
+    #
+    var_macs, var_params = get_model_complexity_info(
+        _build_amar_wo_rvq(var_x_shape, torch.device("cpu")), var_x_shape, as_strings=False)
+    print("Parameters:", var_params, "- FLOPs:", var_macs * 2)
+
+    #
+    ## ========================================= Train & Evaluate =========================================
+    #
+    env_result_accuracy = {}
+    env_result_total_error = {}
+    env_result_ppp = {}
+    env_result_precision = {}
+    env_result_recall = {}
+    env_result_f1_score = {}
+    env_result_time_teacher = {}
+    env_result_time_train = {}
+    env_predict_y_last = {}
+
+    for var_r in range(var_repeat):
+        #
+        ##
+        var_mode = "multi_head"
+        name_run = f"AMAR_fewshot_{var_r}_{env_name}_k{var_few_shot_ratio}"
+        print("Repeat", var_r)
+        wandb.init(
+            project="FINAL_AMAR",
+            name=name_run,
+            config=preset,
+            reinit=True
+        )
+        #
+        torch.random.manual_seed(var_r + 39)
+        #
+        ## ---------------------------------------- Teacher ----------------------------------------
+        #
+        teacher = _build_amar_wo_rvq(var_x_shape, device)
+        if var_compile:
+            teacher.feature_extractor = torch.compile(teacher.feature_extractor)
+
+        teacher_optimizer = torch.optim.Adam(teacher.parameters(),
+                                             lr=preset["nn"]["lr"],
+                                             weight_decay=preset["nn"]["weight_decay"])
+        teacher_loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"]
+        )
+        teacher_time_0 = time.time()
+        teacher_best_weight = train(model=teacher,
+                                    optimizer=teacher_optimizer,
+                                    loss=teacher_loss,
+                                    data_train_set=teacher_train_set,
+                                    data_valid_set=teacher_valid_set,
+                                    var_threshold=preset["nn"]["threshold"],
+                                    var_batch_size=preset["nn"]["batch_size"],
+                                    var_epochs=var_teacher_epochs,
+                                    device=device,
+                                    var_mode=var_mode)
+        teacher_time_1 = time.time()
+        teacher.load_state_dict(teacher_best_weight)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+
+        #
+        ## ---------------------------------------- Student ----------------------------------------
+        #
+        student = _build_amar_wo_rvq(var_x_shape, device)
+        if var_compile:
+            student.feature_extractor = torch.compile(student.feature_extractor)
+
+        student_optimizer = torch.optim.Adam(student.parameters(),
+                                             lr=preset["nn"]["lr"],
+                                             weight_decay=preset["nn"]["weight_decay"])
+        student_loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"]
+        )
+        kd_loss = SetDistillationLoss(
+            temperature=var_kd_temperature,
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            no_object_index=preset["nn"]["num_classes"] - 1
+        )
+        student_time_0 = time.time()
+        student_best_weight = train(model=student,
+                                    optimizer=student_optimizer,
+                                    loss=student_loss,
+                                    data_train_set=student_train_set,
+                                    data_valid_set=student_valid_set,
+                                    var_threshold=preset["nn"]["threshold"],
+                                    var_batch_size=preset["nn"]["batch_size"],
+                                    var_epochs=var_student_epochs,
+                                    device=device,
+                                    var_mode=var_mode,
+                                    teacher=teacher,
+                                    kd_loss=kd_loss,
+                                    kd_weight=var_kd_weight)
+        student_time_1 = time.time()
+        if preset.get("save_model"):
+            save_model_components(preset, student)
+        student.load_state_dict(student_best_weight)
+
+        #
+        ## ---------------------------- Test on the other environments ----------------------------
+        #
+        for test_env_name, (X_env, y_env) in test_sets_by_env.items():
+            X_env_reshaped = X_env.reshape(X_env.shape[0], X_env.shape[1], -1)
+            env_loader = torch.utils.data.DataLoader(
+                TensorDataset(torch.from_numpy(X_env_reshaped), torch.from_numpy(y_env)),
+                batch_size=preset["nn"]["batch_size"], shuffle=False
+            )
+            env_preds = []
+            with torch.no_grad():
+                for xb, _ in env_loader:
+                    env_preds.append(student(xb.to(device)).cpu())
+            env_predict_y = torch.cat(env_preds, dim=1).numpy()
+            env_predict_y_last[test_env_name] = env_predict_y
+            env_metrics = performance_metrics(y_env, env_predict_y, var_mode=var_mode)
+            env_last_layer = env_metrics["layer_" + str(preset["nn"]["num_decoder_layers"] - 1)]
+
+            if test_env_name not in env_result_accuracy:
+                env_result_accuracy[test_env_name] = []
+                env_result_total_error[test_env_name] = []
+                env_result_ppp[test_env_name] = []
+                env_result_precision[test_env_name] = []
+                env_result_recall[test_env_name] = []
+                env_result_f1_score[test_env_name] = []
+                env_result_time_teacher[test_env_name] = []
+                env_result_time_train[test_env_name] = []
+
+            env_result_accuracy[test_env_name].append(env_last_layer['accuracy'])
+            env_result_total_error[test_env_name].append(env_last_layer['total_error'])
+            env_result_ppp[test_env_name].append(env_last_layer['perfect_prediction_percentage'])
+            env_result_precision[test_env_name].append(env_last_layer['precision'])
+            env_result_recall[test_env_name].append(env_last_layer['recall'])
+            env_result_f1_score[test_env_name].append(env_last_layer['f1_score'])
+            env_result_time_teacher[test_env_name].append(teacher_time_1 - teacher_time_0)
+            env_result_time_train[test_env_name].append(student_time_1 - student_time_0)
+
+            wandb.log({
+                f"test_results_per_env/{test_env_name}/accuracy": env_last_layer['accuracy'],
+                f"test_results_per_env/{test_env_name}/total_error": env_last_layer['total_error'],
+                f"test_results_per_env/{test_env_name}/perfect_prediction_percentage": env_last_layer['perfect_prediction_percentage'],
+                f"test_results_per_env/{test_env_name}/precision": env_last_layer['precision'],
+                f"test_results_per_env/{test_env_name}/recall": env_last_layer['recall'],
+                f"test_results_per_env/{test_env_name}/f1_score": env_last_layer['f1_score'],
+                f"test_results_per_env/{test_env_name}/teacher_train_time": teacher_time_1 - teacher_time_0,
+                f"test_results_per_env/{test_env_name}/student_train_time": student_time_1 - student_time_0,
+            }, step=var_r + 100000)
+
+            print(f"  [{test_env_name}] Total Error: {env_last_layer['total_error']:.6f} "
+                  f"| Perfect Prediction %: {env_last_layer['perfect_prediction_percentage']:.6f}")
+
+        del teacher_optimizer, teacher_loss, student_optimizer, student_loss, kd_loss
+        del teacher_best_weight, student_best_weight, env_loader, env_preds
+        torch.cuda.empty_cache()
+        gc.collect()
+        del student, teacher
+
+    #
+    ## -------------------------------------- Aggregate per environment ----------------------------------------
+    #
+    all_envs_results = {}
+    for test_env_name in env_result_accuracy.keys():
+        acc_mean, acc_std, acc_se = _mean_std_se(np.array(env_result_accuracy[test_env_name]))
+        err_mean, err_std, err_se = _mean_std_se(np.array(env_result_total_error[test_env_name]))
+        ppp_mean, ppp_std, ppp_se = _mean_std_se(np.array(env_result_ppp[test_env_name]))
+        prec_mean, prec_std, prec_se = _mean_std_se(np.array(env_result_precision[test_env_name]))
+        rec_mean, rec_std, rec_se = _mean_std_se(np.array(env_result_recall[test_env_name]))
+        f1_mean, f1_std, f1_se = _mean_std_se(np.array(env_result_f1_score[test_env_name]))
+
+        all_envs_results[test_env_name] = {
+            'avg_accuracy': acc_mean, 'std_accuracy': acc_std, 'se_accuracy': acc_se,
+            'avg_total_error': err_mean, 'std_total_error': err_std, 'se_total_error': err_se,
+            'avg_PPP': ppp_mean, 'std_PPP': ppp_std, 'se_PPP': ppp_se,
+            'avg_precision': prec_mean, 'std_precision': prec_std, 'se_precision': prec_se,
+            'avg_recall': rec_mean, 'std_recall': rec_std, 'se_recall': rec_se,
+            'avg_f1_score': f1_mean, 'std_f1_score': f1_std, 'se_f1_score': f1_se,
+            'avg_teacher_train_time': float(np.mean(env_result_time_teacher[test_env_name])),
+            'avg_student_train_time': float(np.mean(env_result_time_train[test_env_name])),
+        }
+
+    for test_env_name, (_, y_env) in test_sets_by_env.items():
+        if test_env_name not in env_predict_y_last:
+            continue
+        visualize_model_performance(
+            y_pred=env_predict_y_last[test_env_name],
+            y_true=y_env,
+            var_mode=var_mode,
+            save_dir=os.path.join(save_path, test_env_name)
+        )
+        stats = all_envs_results[test_env_name]
+        print(f"\n[{test_env_name}] avg over {var_repeat} repeats: "
+              f"Accuracy {stats['avg_accuracy']:.4f} ± {stats['se_accuracy']:.4f} | "
+              f"Total Error {stats['avg_total_error']:.4f} ± {stats['se_total_error']:.4f} | "
+              f"PPP {stats['avg_PPP']:.4f} ± {stats['se_PPP']:.4f} | "
+              f"Precision {stats['avg_precision']:.4f} ± {stats['se_precision']:.4f} | "
+              f"Recall {stats['avg_recall']:.4f} ± {stats['se_recall']:.4f} | "
+              f"F1 {stats['avg_f1_score']:.4f} ± {stats['se_f1_score']:.4f}")
+
+    wandb.finish()
+    return all_envs_results
+
+## ====================================================================================================================
+# FEW-SHOT KNOWLEDGE DISTILLATION ACROSS DATASETS
+
+def run_few_shot_cross_domain(train_sets_by_env, test_sets_by_env, var_support_idx, var_valid_idx,
+                              var_query_idx, var_few_shot_ratio=0.05, var_kd_weight=1.0,
+                              var_kd_temperature=1.0, var_teacher_epochs=None, var_student_epochs=None,
+                              var_init_from_teacher=True, var_compile=True, var_repeat=3,
+                              var_task="activity", var_env="ntu_har",
+                              save_path="./visualizations/temp", var_class_names=None,
+                              var_separation_weight=None):
+    """
+    [description]
+    : Cross-dataset few-shot activity distillation for AMAR_WO_RVQ (NTU-Fi HAR -> WiMANS).
+        teacher -- AMAR_WO_RVQ trained on every source environment, then frozen.
+        student -- AMAR_WO_RVQ warm-started from the teacher and fine-tuned on the support frames of
+                   the target pool with HungarianMatchingLoss + var_kd_weight *
+                   SetDistillationLoss against the frozen teacher.
+        test    -- the target pool's query frames
+    : train_sets_by_env: dict, source environment -> (X, y); the teacher's data
+    : test_sets_by_env: dict, target environment -> (X, y); the support/valid/query pool, concatenated
+      in dict order.
+    : var_support_idx / var_valid_idx / var_query_idx: global index arrays into that concatenation, as
+      built by src.data.activity_transfer.split_target_pool
+    : var_kd_weight: weight of the distillation term (0 = supervised few-shot only)
+    : var_init_from_teacher: warm-start the student from the teacher's weights
+    : var_class_names: activity names in the class ordering (without the no-object class). 
+    : return: dict {target environment: {'avg_student_<metric>', 'avg_teacher_<metric>', ...}}
+    """
+    #
+    ##
+    device = select_device()
+    print(f"Using device: {device}")
+    if var_teacher_epochs is None:
+        var_teacher_epochs = preset["nn"]["epoch"]
+    if var_student_epochs is None:
+        var_student_epochs = preset["nn"]["epoch"]
+    var_mode = "multi_head"
+    var_target_names = list(test_sets_by_env)
+    ## activity separation objective on the student: explicit arg wins, else the preset key (0 = off)
+    var_sep_weight = (float(preset["nn"]["loss"].get("separation_weight", 0.0))
+                      if var_separation_weight is None else float(var_separation_weight))
+    #
+    ## ------------------------- source data: one 90/10 split, as run_cross_domain ------------------
+    var_teacher_x = np.concatenate([np.asarray(train_sets_by_env[var_name][0], dtype=np.float32)
+                                    for var_name in train_sets_by_env])
+    var_teacher_y = np.concatenate([np.asarray(train_sets_by_env[var_name][1], dtype=np.float32)
+                                    for var_name in train_sets_by_env])
+    var_teacher_x = var_teacher_x.reshape(len(var_teacher_x), var_teacher_x.shape[1], -1)
+    var_x_shape = tuple(var_teacher_x.shape[1:])
+    var_perm = np.random.RandomState(39).permutation(len(var_teacher_x))
+    var_num_valid = max(1, int(round(0.1 * len(var_teacher_x))))
+    var_t_valid = np.sort(var_perm[:var_num_valid])
+    var_t_train = np.sort(var_perm[var_num_valid:])
+    teacher_train_set = TensorDataset(torch.from_numpy(var_teacher_x[var_t_train]),
+                                      torch.from_numpy(var_teacher_y[var_t_train]))
+    teacher_valid_set = TensorDataset(torch.from_numpy(var_teacher_x[var_t_valid]),
+                                      torch.from_numpy(var_teacher_y[var_t_valid]))
+    #
+    ## --------------------- target pool: support / student validation / query ----------------------
+
+    var_pool_sizes = [len(test_sets_by_env[var_name][0]) for var_name in var_target_names]
+    var_pool_starts = np.cumsum([0] + var_pool_sizes[:-1])
+
+    def _gather_pool_rows(var_idx):
+        """
+        [description]
+        : the rows of the per-env pool at the global indices var_idx, without building the whole
+          concatenation (which would double the memory of a union run).
+        : return: (x, y) of those rows, in ascending index order
+        """
+        var_x_parts, var_y_parts = [], []
+        for var_name, var_start, var_size in zip(var_target_names, var_pool_starts, var_pool_sizes):
+            var_mask = (var_idx >= var_start) & (var_idx < var_start + var_size)
+            if var_mask.any():
+                var_local = var_idx[var_mask] - var_start
+                var_x_parts.append(np.asarray(test_sets_by_env[var_name][0][var_local],
+                                              dtype=np.float32))
+                var_y_parts.append(np.asarray(test_sets_by_env[var_name][1][var_local],
+                                              dtype=np.float32))
+        return np.concatenate(var_x_parts), np.concatenate(var_y_parts)
+
+    var_support_x, var_support_y = _gather_pool_rows(var_support_idx)
+    var_valid_x, var_valid_y = _gather_pool_rows(var_valid_idx)
+    student_train_set = TensorDataset(torch.from_numpy(var_support_x),
+                                      torch.from_numpy(var_support_y))
+    student_valid_set = TensorDataset(torch.from_numpy(var_valid_x),
+                                      torch.from_numpy(var_valid_y))
+    print(f"Source {var_teacher_x.shape[0]} frames ({len(var_t_train)} train / {len(var_t_valid)} valid)")
+    print(f"Target pool {int(np.sum(var_pool_sizes))} frames -> support {len(var_support_idx)} "
+          f"({var_few_shot_ratio:.2%}) | student validation {len(var_valid_idx)} | "
+          f"query {len(var_query_idx)}")
+    print(f"kd_weight {var_kd_weight} | kd_temperature {var_kd_temperature} | "
+          f"separation_weight {var_sep_weight} | init_from_teacher {var_init_from_teacher}")
+    #
+    ## ---------------------------------------- complexity -----------------------------------------
+    #
+    var_macs, var_params = get_model_complexity_info(
+        _build_amar_wo_rvq(var_x_shape, torch.device("cpu")), var_x_shape, as_strings=False)
+    print("Parameters:", var_params, "- FLOPs:", var_macs * 2)
+    #
+    ## ========================================= Train & Evaluate ====================================
+    #
+    var_metric_names = ("accuracy", "precision", "recall", "f1_score",
+                        "perfect_prediction_percentage", "total_error",
+                        "micro_f1", "present_f1", "present_recall")
+    var_student_metrics = {var_name: {var_m: [] for var_m in var_metric_names}
+                           for var_name in var_target_names}
+    var_teacher_metrics = {var_name: {var_m: [] for var_m in var_metric_names}
+                           for var_name in var_target_names}
+    var_time_teacher, var_time_student = [], []
+    var_predict_y_last = {}
+    ## {environment: {"teacher"/"student": per-slot summary}}, filled on the last repeat only
+    var_clustering = {var_name: {} for var_name in var_target_names}
+    ## {who: {field: [per-environment arrays]}}, the cross-room embedding-metadata figure's input,
+    ## also filled on the last repeat only
+    var_meta_collect = {var_who: {var_field: [] for var_field in
+                                  ("points", "activity", "room", "split", "occupants", "padding")}
+                        for var_who in ("teacher", "student")}
+    #
+    for var_r in range(var_repeat):
+        wandb.init(project="FINAL_AMAR",
+                   name=f"AMAR_fewshot_{var_env}_k{var_few_shot_ratio}_r{var_r}",
+                   config=preset, reinit=True)
+        torch.random.manual_seed(var_r + 39)
+        #
+        ## ------------------------------------------- teacher -------------------------------------
+        teacher = _build_amar_wo_rvq(var_x_shape, device)
+        if var_compile:
+            teacher.feature_extractor = torch.compile(teacher.feature_extractor)
+        teacher_optimizer = torch.optim.Adam(teacher.parameters(), lr=preset["nn"]["lr"],
+                                             weight_decay=preset["nn"]["weight_decay"])
+        teacher_loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"])
+        var_time_0 = time.time()
+        teacher_best_weight = train(model=teacher, optimizer=teacher_optimizer, loss=teacher_loss,
+                                    data_train_set=teacher_train_set,
+                                    data_valid_set=teacher_valid_set,
+                                    var_threshold=preset["nn"]["threshold"],
+                                    var_batch_size=preset["nn"]["batch_size"],
+                                    var_epochs=var_teacher_epochs, device=device, var_mode=var_mode)
+        var_time_1 = time.time()
+        teacher.load_state_dict(teacher_best_weight)
+        teacher.eval()
+        for var_param in teacher.parameters():
+            var_param.requires_grad = False
+        #
+        ## ------------------------------------------- student -------------------------------------
+        student = _build_amar_wo_rvq(var_x_shape, device)
+        if var_compile:
+            student.feature_extractor = torch.compile(student.feature_extractor)
+        if var_init_from_teacher:
+            ## compile before the warm start
+            student.load_state_dict(teacher.state_dict())
+        student_optimizer = torch.optim.Adam(student.parameters(), lr=preset["nn"]["lr"],
+                                             weight_decay=preset["nn"]["weight_decay"])
+        student_loss = HungarianMatchingLoss(
+            cost_class_weight=preset["nn"]["loss"]["cost_class_weight"],
+            aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+            label_smoothing=preset["nn"]["loss"]["label_smoothing"],
+            class_imbalance_weight=preset["nn"]["loss"]["class_imbalance_weight"],
+            num_classes=preset["nn"]["num_classes"])
+        kd_loss = SetDistillationLoss(temperature=var_kd_temperature,
+                                      aux_loss_weight=preset["nn"]["loss"]["aux_loss_weight"],
+                                      no_object_index=preset["nn"]["num_classes"] - 1)
+        var_sep_loss = (QuerySeparationLoss(
+            temperature=preset["nn"]["loss"].get("separation_temperature", 0.1),
+            no_object_index=preset["nn"]["num_classes"] - 1) if var_sep_weight > 0 else None)
+        student_best_weight = train(model=student, optimizer=student_optimizer, loss=student_loss,
+                                    data_train_set=student_train_set,
+                                    data_valid_set=student_valid_set,
+                                    var_threshold=preset["nn"]["threshold"],
+                                    var_batch_size=preset["nn"]["batch_size"],
+                                    var_epochs=var_student_epochs, device=device, var_mode=var_mode,
+                                    teacher=teacher, kd_loss=kd_loss, kd_weight=var_kd_weight,
+                                    separation_loss=var_sep_loss, separation_weight=var_sep_weight)
+        var_time_2 = time.time()
+        if preset.get("save_model"):
+            save_model_components(preset, student)
+        student.load_state_dict(student_best_weight)
+        student.eval()
+        var_time_teacher.append(var_time_1 - var_time_0)
+        var_time_student.append(var_time_2 - var_time_1)
+        #
+        ## -------------------------------- query frames per target env ----------------------------
+        var_offset = 0
+        for var_name in var_target_names:
+            var_size = len(test_sets_by_env[var_name][0])
+            var_mask = (var_query_idx >= var_offset) & (var_query_idx < var_offset + var_size)
+            ## the query frames are read out of this env's own array (no concatenated pool), so the
+            ## indices are shifted to the env's start; visualize_query_clustering takes the same ones
+            var_sel_local = var_query_idx[var_mask] - var_offset
+            var_offset += var_size
+            if len(var_sel_local) == 0:
+                continue
+            var_student_preds, var_teacher_preds = [], []
+            with torch.no_grad():
+                for var_b in range(0, len(var_sel_local), preset["nn"]["batch_size"]):
+                    var_xb = torch.from_numpy(
+                        test_sets_by_env[var_name][0][
+                            var_sel_local[var_b:var_b + preset["nn"]["batch_size"]]]).to(device)
+                    var_student_preds.append(student(var_xb).cpu())
+                    var_teacher_preds.append(teacher(var_xb).cpu())
+            var_student_y = torch.cat(var_student_preds, dim=1).numpy()
+            var_teacher_y = torch.cat(var_teacher_preds, dim=1).numpy()
+            var_q_y = test_sets_by_env[var_name][1][var_sel_local]
+            var_predict_y_last[var_name] = (var_q_y, var_student_y)
+            var_s_metrics = performance_metrics(var_q_y, var_student_y, var_mode=var_mode)
+            var_t_metrics = performance_metrics(var_q_y, var_teacher_y, var_mode=var_mode)
+            for var_metric in var_metric_names:
+                var_student_metrics[var_name][var_metric].append(var_s_metrics[var_metric])
+                var_teacher_metrics[var_name][var_metric].append(var_t_metrics[var_metric])
+            wandb.log({
+                f"query/{var_name}/student_accuracy": var_s_metrics['accuracy'],
+                f"query/{var_name}/student_f1_score": var_s_metrics['f1_score'],
+                f"query/{var_name}/student_micro_f1": var_s_metrics['micro_f1'],
+                f"query/{var_name}/student_present_f1": var_s_metrics['present_f1'],
+                f"query/{var_name}/student_perfect_prediction_percentage":
+                    var_s_metrics['perfect_prediction_percentage'],
+                f"query/{var_name}/teacher_accuracy": var_t_metrics['accuracy'],
+                f"query/{var_name}/teacher_f1_score": var_t_metrics['f1_score'],
+                f"query/{var_name}/teacher_micro_f1": var_t_metrics['micro_f1'],
+            }, step=var_r + 100000)
+            print(f"  [{var_name}] query {len(var_sel_local)} frames | student micro-F1 "
+                  f"{var_s_metrics['micro_f1']:.4f} (present-F1 {var_s_metrics['present_f1']:.4f}, "
+                  f"PPP {var_s_metrics['perfect_prediction_percentage']:.4f}) | teacher micro-F1 "
+                  f"{var_t_metrics['micro_f1']:.4f}")
+            if var_class_names is not None and var_r == var_repeat - 1:
+                ## the live models are needed, so this is done on the last repeat's, beside the
+                ## confusion matrices the aggregation below draws from that same repeat
+                var_x_env = test_sets_by_env[var_name][0]
+                var_pad = per_sample_padding_fraction(var_x_env, var_sel_local)
+                ## occupant count per frame: the target slots that are not the no-object class
+                var_occupants = (np.asarray(var_q_y).argmax(-1)
+                                 != np.asarray(var_q_y).shape[-1] - 1).sum(axis=1)
+                for var_who, var_model_here in (("teacher", teacher), ("student", student)):
+                    var_clustering[var_name][var_who] = visualize_query_clustering(
+                        var_model_here, var_x_env, var_q_y, var_class_names,
+                        save_path=os.path.join(save_path, var_name), var_index=var_sel_local,
+                        var_model_name=f"{var_who}_r{var_r}")
+                    ## the same matched-slot points, kept so the cross-room figure below can colour
+                    ## them by room / split / occupancy as well as activity
+                    var_points, var_act, _, var_matched = matched_slot_points(
+                        var_model_here, var_x_env, var_q_y, var_index=var_sel_local,
+                        var_batch_size=preset["nn"]["batch_size"], var_device=device)
+                    var_meta_collect[var_who]["points"].append(var_points)
+                    var_meta_collect[var_who]["activity"].append(var_act)
+                    var_meta_collect[var_who]["room"].append(np.full(len(var_points), var_name))
+                    var_meta_collect[var_who]["split"].append(np.full(
+                        len(var_points), "synth" if var_name.endswith("_synth") else "real"))
+                    var_meta_collect[var_who]["occupants"].append(var_occupants[var_matched])
+                    var_meta_collect[var_who]["padding"].append(var_pad[var_matched])
+        if var_class_names is not None and var_r == var_repeat - 1:
+            ## one figure per model over every target environment at once: the single-room t-SNE
+            ## cannot show whether the embedding separates rooms or domains rather than activities
+            for var_who in ("teacher", "student"):
+                var_store = var_meta_collect[var_who]
+                if not var_store["points"]:
+                    continue
+                var_meta = {var_field: np.concatenate(var_values)
+                            for var_field, var_values in var_store.items()
+                            if var_field not in ("points", "activity")}
+                var_meta_summary = visualize_query_tsne_metadata(
+                    np.concatenate(var_store["points"]), np.concatenate(var_store["activity"]),
+                    var_class_names, var_meta, save_path, f"{var_who}_r{var_r}")
+                print(f"  [{var_who}] embedding metadata separation: " + " | ".join(
+                    f"{var_field} kNN-purity {var_info['knn_purity']:.2f} vs chance "
+                    f"{var_info['chance']:.2f}" for var_field, var_info in var_meta_summary.items()
+                    if isinstance(var_info, dict)))
+        wandb.finish()
+        del teacher_optimizer, teacher_loss, student_optimizer, student_loss, kd_loss
+        del teacher_best_weight, student_best_weight
+        torch.cuda.empty_cache()
+        gc.collect()
+        del student, teacher
+    #
+    ## ------------------------------------------ aggregate -----------------------------------------
+    all_envs_results = {}
+    for var_name in var_target_names:
+        var_env_result = {}
+        for var_metric in var_metric_names:
+            for var_who, var_store in (("student", var_student_metrics), ("teacher", var_teacher_metrics)):
+                var_mean, var_std, var_se = _mean_std_se(np.array(var_store[var_name][var_metric]))
+                var_env_result[f"avg_{var_who}_{var_metric}"] = var_mean
+                var_env_result[f"std_{var_who}_{var_metric}"] = var_std
+                var_env_result[f"se_{var_who}_{var_metric}"] = var_se
+        var_env_result["avg_teacher_train_time"] = float(np.mean(var_time_teacher))
+        var_env_result["avg_student_train_time"] = float(np.mean(var_time_student))
+        if var_clustering[var_name]:
+            var_env_result["clustering"] = var_clustering[var_name]
+        all_envs_results[var_name] = var_env_result
+    #
+    for var_name, (var_true_y, var_pred_y) in var_predict_y_last.items():
+        visualize_model_performance(y_pred=var_pred_y, y_true=var_true_y, var_mode=var_mode,
+                                    save_dir=os.path.join(save_path, var_name))
+        var_stats = all_envs_results[var_name]
+  
+        print(f"\n[{var_name}] avg over {var_repeat} repeats: "
+              f"Student micro-F1 {var_stats['avg_student_micro_f1']:.4f} ± "
+              f"{var_stats['se_student_micro_f1']:.4f} | Student present-F1 "
+              f"{var_stats['avg_student_present_f1']:.4f} | "
+              f"Teacher micro-F1 {var_stats['avg_teacher_micro_f1']:.4f} ± "
+              f"{var_stats['se_teacher_micro_f1']:.4f} | "
+              f"(TN-inflated accuracy: student {var_stats['avg_student_accuracy']:.4f}, "
+              f"teacher {var_stats['avg_teacher_accuracy']:.4f})")
+    return all_envs_results

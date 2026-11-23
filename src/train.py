@@ -1,0 +1,290 @@
+"""
+[file]          train.py
+[description]   function to train WiFi-based models
+"""
+#
+##
+import time
+import torch
+import torch._dynamo
+from torch import device
+from torch.nn import Module
+from torch.optim import Optimizer
+from torch.utils.data import TensorDataset, DataLoader
+from copy import deepcopy
+from sklearn.metrics import accuracy_score
+import wandb
+from src.utils import *
+from torch.optim.lr_scheduler import LambdaLR
+import math
+from configs.preset import preset
+
+#
+##
+torch.set_float32_matmul_precision("high")
+torch._dynamo.config.cache_size_limit = 65536
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.1):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+#
+##
+def train(model: Module,
+          optimizer: Optimizer,
+          loss: Module,
+          data_train_set: TensorDataset,
+          data_valid_set: TensorDataset,
+          var_threshold: float,
+          var_batch_size: int,
+          var_epochs: int,
+          device: device,
+          var_mode: str,
+          patience: int = 150,
+          teacher: Module = None,
+          kd_loss: Module = None,
+          kd_weight: float = 0.0,
+          separation_loss: Module = None,
+          separation_weight: float = 0.0): 
+    """
+    [description]
+    : train a model. When `teacher` and `kd_loss` are provided, the frozen teacher is run on
+      every batch (train and validation) and its outputs are distilled into the model with
+      `kd_weight * kd_loss(student_outputs, teacher_outputs)` added to the supervised loss.
+    [parameter]
+    : model: the model; when `separation_loss` is active it is called as model(x, return_embedding=True)
+      and must return (class_outputs, query_embeddings)
+    : teacher: frozen model used as distillation target (evaluated under torch.no_grad)
+    : kd_loss: distillation criterion taking (student_outputs, teacher_outputs)
+    : kd_weight: weight of the distillation term
+    : separation_loss: contrastive criterion taking (query_embeddings, targets, hungarian_indices),
+      e.g. QuerySeparationLoss; its anchors are the same Hungarian-matched pairs the supervised loss
+      uses, so it must be paired with a `loss` that exposes Hungarian_matching (HungarianMatchingLoss)
+    : separation_weight: weight of the separation term (0 = off)
+    : model selection: the checkpoint returned is the epoch with the highest validation score under
+      preset["nn"]["select_metric"] -- "ppp" (perfect_prediction_percentage, the historical default) or
+      "micro_f1" (not inflated by class absence; see calculate_scores)
+    """
+    use_distillation = teacher is not None and kd_loss is not None and kd_weight > 0
+    use_separation = separation_loss is not None and separation_weight > 0
+    if use_separation and not hasattr(loss, "Hungarian_matching"):
+        raise TypeError("separation_loss needs a supervised `loss` exposing Hungarian_matching "
+                        "(e.g. HungarianMatchingLoss) to reuse its matched pairs")
+
+    def separation_term(var_outputs, var_embeddings, var_targets):
+        """Contrast the Hungarian-matched query embeddings by activity (QuerySeparationLoss)."""
+        var_logits = var_outputs[-1] if var_outputs.dim() == 4 else var_outputs
+        return separation_loss(var_embeddings, var_targets,
+                               loss.Hungarian_matching(var_logits, var_targets))
+    #choose metric between ppp for usual runs and micro_f1 for few-shot runs where ppp is not a good metric
+    var_select_metric = preset["nn"].get("select_metric", "ppp")
+    if var_select_metric not in ("ppp", "micro_f1"):
+        raise ValueError(f"preset['nn']['select_metric'] must be 'ppp' or 'micro_f1', "
+                         f"got {var_select_metric!r}")
+    var_epoch_saved = 0
+    g = torch.Generator()
+    data_train_loader = DataLoader(data_train_set, var_batch_size, shuffle=True, pin_memory=True, generator=g)
+    data_valid_loader = DataLoader(data_valid_set, len(data_valid_set))
+
+    var_best_f1_score = 0
+
+    var_best_select_score = -1.0 if var_select_metric == "micro_f1" else 0.0
+    var_best_weight = deepcopy(model.state_dict())
+    counter = 0  # Counter for patience
+
+    if var_mode == "multi_head":
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=preset["nn"]["scheduler"]["num_warmup_epochs"] * len(data_train_loader),
+            num_training_steps=var_epochs * len(data_train_loader),
+            min_lr_ratio=preset["nn"]["scheduler"]["min_lr_ratio"]
+        )
+
+    def apply_augmentation(x_batch):
+        noise = torch.randn_like(x_batch) * 0.1
+        x_batch = x_batch + noise
+        scale = torch.rand(x_batch.size(0), 1, device=x_batch.device) * 0.2 + 1
+        x_batch = x_batch * scale.unsqueeze(-1)
+        mask = torch.bernoulli(torch.ones_like(x_batch) * 0.96)
+        x_batch = x_batch * mask
+
+        return x_batch
+
+    for var_epoch in range(var_epochs):
+        var_time_e0 = time.time()
+        model.train()
+        total_batches = len(data_train_loader)
+
+       
+        if var_epoch == 50: #scheduler for better convergence
+            for param_group in optimizer.param_groups:
+                if param_group.get('name') == 'feature_extractor':
+                    param_group['lr'] /= 5
+                    print(f"Reduced LR for feature_extractor to {param_group['lr']} at epoch {var_epoch}")
+
+        for batch_idx, data_batch in enumerate(data_train_loader):
+            data_batch_x, data_batch_y = data_batch
+            data_batch_x = data_batch_x.to(device)
+            data_batch_y = data_batch_y.to(device)
+            
+
+            if model.training:
+                data_batch_x = apply_augmentation(data_batch_x)
+
+            if var_mode == "count_classification":
+                data_batch_y = data_batch_y.sum(axis=1)
+            elif var_mode == "baseline":
+                data_batch_y = data_batch_y.reshape(data_batch_y.shape[0], -1)
+
+            if use_separation:
+                predict_train_y, var_embed_train = model(data_batch_x, return_embedding=True)
+            else:
+                predict_train_y = model(data_batch_x)
+                var_embed_train = None
+            var_loss_train = loss(predict_train_y, data_batch_y.float())
+            var_loss_sep_train = None
+            if use_separation:
+                var_loss_sep_train = separation_term(predict_train_y, var_embed_train,
+                                                     data_batch_y.float())
+                var_loss_train = var_loss_train + separation_weight * var_loss_sep_train
+            var_loss_kd_train = None
+            if use_distillation:
+                with torch.no_grad():
+                    teacher_train_y = teacher(data_batch_x)
+                var_loss_kd_train = kd_loss(predict_train_y, teacher_train_y)
+                var_loss_train = var_loss_train + kd_weight * var_loss_kd_train
+            optimizer.zero_grad()
+            var_loss_train.backward()
+            optimizer.step()
+            if var_mode == "multi_head":
+                scheduler.step()
+
+        data_batch_y = data_batch_y.detach().cpu().numpy()
+        predict_train_y = predict_train_y.detach().cpu().numpy()
+        dict_error_train = performance_metrics(data_batch_y.astype(int), predict_train_y,
+                                               var_mode=var_mode, var_threshold=var_threshold)
+
+        model.eval()
+        with torch.no_grad():
+            data_valid_x, data_valid_y = next(iter(data_valid_loader))
+            data_valid_x = data_valid_x.to(device)
+            data_valid_y = data_valid_y.to(device)
+            if var_mode == "count_classification":
+                data_valid_y = data_valid_y.sum(axis=1)
+            if var_mode == "baseline":
+                data_valid_y = data_valid_y.reshape(data_valid_y.shape[0], -1)
+
+            if use_separation:
+                predict_valid_y, var_embed_valid = model(data_valid_x, return_embedding=True)
+            else:
+                predict_valid_y = model(data_valid_x)
+                var_embed_valid = None
+            var_loss_valid = loss(predict_valid_y, data_valid_y.float())
+            var_loss_sep_valid = None
+            if use_separation:
+                var_loss_sep_valid = separation_term(predict_valid_y, var_embed_valid,
+                                                     data_valid_y.float())
+                var_loss_valid = var_loss_valid + separation_weight * var_loss_sep_valid
+            var_loss_kd_valid = None
+            if use_distillation:
+                teacher_valid_y = teacher(data_valid_x)
+                var_loss_kd_valid = kd_loss(predict_valid_y, teacher_valid_y)
+                var_loss_valid = var_loss_valid + kd_weight * var_loss_kd_valid
+
+            data_valid_y = data_valid_y.detach().cpu().numpy()
+            predict_valid_y = predict_valid_y.detach().cpu().numpy()
+
+            dict_error_valid = performance_metrics(data_valid_y, predict_valid_y, var_mode, var_threshold)
+
+        var_extra_logs = {}
+        if use_distillation:
+            var_extra_logs["train_loss_kd"] = var_loss_kd_train.item()
+            var_extra_logs["valid_loss_kd"] = var_loss_kd_valid.item()
+        if use_separation:
+            var_extra_logs["train_loss_separation"] = var_loss_sep_train.item()
+            var_extra_logs["valid_loss_separation"] = var_loss_sep_valid.item()
+
+        if preset["model"] == "AMAR":
+            layers_idxs = ["layer_" +str(preset["nn"]["num_decoder_layers"] - 1)]
+            for layer_idx in layers_idxs:
+                layer_metrics = dict_error_valid[layer_idx]
+                layer_train_metrics = dict_error_train[layer_idx]
+                wandb.log({
+                    f"{layer_idx}/epoch": var_epoch,
+                    f"{layer_idx}/train_loss": var_loss_train.item(),
+                    f"{layer_idx}/valid_loss": var_loss_valid.item(),
+                    f"{layer_idx}/total_error_train": layer_train_metrics['total_error'],
+                    f"{layer_idx}/total_error_valid": layer_metrics['total_error'],
+                    f"{layer_idx}/perfect_prediction_percentage_valid": layer_metrics['perfect_prediction_percentage'],
+                    f"{layer_idx}/perfect_prediction_percentage_train": layer_train_metrics[
+                        'perfect_prediction_percentage'],
+                    f"{layer_idx}/accuracy_valid": layer_metrics['accuracy'],
+                    f"{layer_idx}/accuracy_train": layer_train_metrics['accuracy'],
+                    f"{layer_idx}/precision": layer_metrics['precision'],
+                    f"{layer_idx}/recall": layer_metrics['recall'],
+                    f"{layer_idx}/f1_score": layer_metrics['f1_score'],
+                    f"{layer_idx}/micro_f1_valid": layer_metrics['micro_f1'],
+                    f"{layer_idx}/present_f1_valid": layer_metrics['present_f1'],
+                    "learning_rate": optimizer.param_groups[0]['lr'],
+                    **var_extra_logs
+                }, 
+                step=var_epoch)
+
+                if var_epoch % 10 == 0:
+                    print(f"--- Layer {layer_idx} - Epoch {var_epoch}/{var_epochs} ---")
+                    print(f"  Time: {time.time() - var_time_e0:.6f}s")
+                    print(f"  Loss Train: {var_loss_train.cpu():.6f} | Loss valid: {var_loss_valid.cpu():.6f}")
+                    print(f"  Total Error Train: {layer_train_metrics['total_error']:.6f} | Total Error valid: {layer_metrics['total_error']:.6f}")
+                    print(f"  Perfect Prediction % Train: {layer_train_metrics['perfect_prediction_percentage']:.6f} | Perfect Prediction % valid: {layer_metrics['perfect_prediction_percentage']:.6f}")
+                    print(f"  Accuracy Train: {layer_train_metrics['accuracy']:.6f} | Accuracy valid: {layer_metrics['accuracy']:.6f}")
+                    print(f"  Precision: {layer_metrics['precision']:.6f} | Recall: {layer_metrics['recall']:.6f} | F1 Score: {layer_metrics['f1_score']:.6f}")
+                    print(f"  micro-F1 valid: {layer_metrics['micro_f1']:.6f} | present-F1 valid: {layer_metrics['present_f1']:.6f} | selection: {var_select_metric}")
+                    print("-" * 30)
+        else:
+            # Original logging for non-multi_head modes
+            wandb.log({
+                "epoch": var_epoch,
+                "train_loss": var_loss_train.item(),
+                "valid_loss": var_loss_valid.item(),
+                "total_error_train": dict_error_train['total_error'],
+                "total_error_valid": dict_error_valid['total_error'],
+                "perfect_prediction_percentage_valid": dict_error_valid['perfect_prediction_percentage'],
+                "perfect_prediction_percentage_train": dict_error_train['perfect_prediction_percentage'],
+                "accuracy_valid": dict_error_valid['accuracy'],
+                "accuracy_train": dict_error_train['accuracy'],
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "precision": dict_error_valid['precision'],
+                "recall": dict_error_valid['recall'],
+                "f1_score": dict_error_valid['f1_score'],
+                "micro_f1_valid": dict_error_valid['micro_f1'],
+                "present_f1_valid": dict_error_valid['present_f1'],
+                **var_extra_logs
+            }, 
+            step=var_epoch)
+            if var_epoch % 10 == 0:
+                print(f"--- Epoch {var_epoch}/{var_epochs} ---")
+                print(f"  Time: {time.time() - var_time_e0:.6f}s")
+                print(f"  Loss Train: {var_loss_train.cpu():.6f} | Loss valid: {var_loss_valid.cpu():.6f}")
+                print(f"  Total Error Train: {dict_error_train['total_error']:.6f} | Total Error valid: {dict_error_valid['total_error']:.6f}")
+                print(f"  Perfect Prediction % Train: {dict_error_train['perfect_prediction_percentage']:.6f} | Perfect Prediction % valid: {dict_error_valid['perfect_prediction_percentage']:.6f}")
+                print(f"  Accuracy Train: {dict_error_train['accuracy']:.6f} | Accuracy valid: {dict_error_valid['accuracy']:.6f}")
+                print(f"  Precision: {dict_error_valid['precision']:.6f} | Recall: {dict_error_valid['recall']:.6f} | F1 Score: {dict_error_valid['f1_score']:.6f}")
+                print(f"  micro-F1 valid: {dict_error_valid['micro_f1']:.6f} | present-F1 valid: {dict_error_valid['present_f1']:.6f} | selection: {var_select_metric}")
+                print("-" * 30)
+
+        var_select_score = (dict_error_valid['micro_f1'] if var_select_metric == "micro_f1"
+                            else dict_error_valid['perfect_prediction_percentage'])
+        if (var_epoch > 0 and var_select_score > var_best_select_score):
+            var_best_select_score = var_select_score
+
+            var_best_f1_score = dict_error_valid['f1_score']
+            var_best_weight = deepcopy(model.state_dict())
+            var_epoch_saved = var_epoch
+
+    print(f"Epoch that the model was saved {var_epoch_saved} - "
+          f"best {var_select_metric} {var_best_select_score:.4f}")
+    return var_best_weight
+

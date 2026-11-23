@@ -1,0 +1,1236 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, f1_score
+import torch
+import json
+import wandb
+import os
+import re
+import time
+import warnings
+from pathlib import Path
+
+
+LOCATION_SIZE = 5
+ACTIVITY_SIZE = 9
+MAX_NB_PEOPLE = 6
+GT_COLOR = "#F06595"
+PRED_COLOR = "#20B8CF"
+CONST_TRAIN_COLOR = "#d9480f"
+PRIOR_COLOR = "#32a852"
+CMAP = "cool"
+
+def load_model_components(model, load_path, lr, scenario="full", device=None):
+    """
+    Selectively load JEPA model components based on scenario from full model state dict
+
+    Args:
+        model: JEPA_Sup model
+        load_path: Path to load full model state dict
+        lr: Base learning rate
+        scenario: One of ["full", "freeze_encoder", "low_lr_encoder", "decoder_only", "new_init"]
+        device: torch device
+
+    Returns:
+        model: Updated model with loaded weights
+        param_groups: List of parameter groups with their learning rates
+    """
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+        print(f"Using device: {device}")
+
+    # Handle the case where no pretrained model should be loaded
+    if scenario == "new_init":
+        print("Using random initialization for all components")
+        param_groups = [{'params': model.parameters(), 'lr': lr}]
+        return model, param_groups
+
+    # Load pretrained state dict
+    try:
+        checkpoint = torch.load(load_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        print("Using random initialization for all components")
+        param_groups = [{'params': model.parameters(), 'lr': lr}]
+        return model, param_groups
+
+    param_groups = []
+    loaded_components = []
+
+    def clean_key_name(key):
+        """Remove _orig_mod. prefix from torch.compile() keys"""
+        return key.replace('_orig_mod.', '')
+
+    def load_component(component_name, target_module, lr_multiplier=1.0, freeze=False):
+        """Helper function to load a specific component"""
+        # Find keys that match the component (handle both compiled and non-compiled)
+        component_dict = {}
+        prefixes = [f'{component_name}.', f'{component_name}._orig_mod.']
+
+        for key, value in state_dict.items():
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    # Clean the key name for loading
+                    clean_key = clean_key_name(key)
+                    target_key = clean_key.replace(f'{component_name}.', '')
+                    component_dict[target_key] = value
+                    break
+
+        if component_dict:
+            try:
+                target_module.load_state_dict(component_dict, strict=False)
+                loaded_components.append(component_name)
+                print(f"✅ Loaded {component_name} ({len(component_dict)} parameters)")
+
+                # Set learning rate and freezing
+                if freeze:
+                    for param in target_module.parameters():
+                        param.requires_grad = False
+                    print(f"🔒 Frozen {component_name}")
+                else:
+                    param_groups.append({
+                        'params': target_module.parameters(),
+                        'lr': lr * lr_multiplier,
+                        'name': component_name
+                    })
+                    print(f"📚 {component_name} LR: {lr * lr_multiplier}")
+            except Exception as e:
+                print(f"❌ Failed to load {component_name}: {e}")
+        else:
+            print(f"⚠️ No weights found for {component_name}")
+
+    # Execute loading based on scenario
+    if scenario == "full":
+        # Load everything and use normal learning rates
+        try:
+            # Handle compiled model state dict
+            cleaned_state_dict = {}
+            for key, value in state_dict.items():
+                cleaned_key = clean_key_name(key)
+                cleaned_state_dict[cleaned_key] = value
+
+            model.load_state_dict(cleaned_state_dict, strict=False)
+            param_groups.append({'params': model.parameters(), 'lr': lr})
+            print("✅ Loaded full model with all pretrained weights")
+        except Exception as e:
+            print(f"❌ Failed to load full model: {e}")
+            param_groups.append({'params': model.parameters(), 'lr': lr})
+
+    elif scenario == "freeze_encoder":
+        # A. Freeze feature extractor and transformer encoder, normal learning for decoder
+        load_component('online_cnn_feature_extractor', model.online_cnn_feature_extractor, freeze=True)
+        load_component('online_transformer_encoder', model.online_transformer_encoder, freeze=True)
+
+        # Decoder gets normal learning rate (not loaded from pretrained)
+        param_groups.append({
+            'params': model.decoder.parameters(),
+            'lr': lr,
+            'name': 'decoder'
+        })
+        print(f"📚 decoder LR: {lr}")
+
+    elif scenario == "low_lr_encoder":
+        # B. Low learning rate for encoders, normal lr for decoder
+        load_component('online_cnn_feature_extractor', model.online_cnn_feature_extractor, lr_multiplier=0.01)
+        load_component('online_transformer_encoder', model.online_transformer_encoder, lr_multiplier=0.1)
+
+        # Decoder gets normal learning rate (not loaded from pretrained)
+        param_groups.append({
+            'params': model.decoder.parameters(),
+            'lr': lr,
+            'name': 'decoder'
+        })
+        print(f"📚 decoder LR: {lr}")
+
+    elif scenario == "decoder_only":
+        # Load only decoder, keep encoders random with normal learning rates
+        load_component('decoder', model.decoder, lr_multiplier=0.1)
+
+        # Encoders get normal learning rates (random initialization)
+        param_groups.extend([
+            {
+                'params': model.online_cnn_feature_extractor.parameters(),
+                'lr': lr,
+                'name': 'online_cnn_feature_extractor'
+            },
+            {
+                'params': model.online_transformer_encoder.parameters(),
+                'lr': lr,
+                'name': 'online_transformer_encoder'
+            }
+        ])
+        print(f"📚 Encoders LR: {lr}")
+
+    else:
+        raise ValueError(
+            f"Unknown scenario: {scenario}. Choose from: "
+            f"'full', 'freeze_encoder', 'low_lr_encoder', 'decoder_only', 'new_init'"
+        )
+
+    # Always update target encoder to match online encoder (for EMA)
+    if hasattr(model, 'target_cnn_feature_extractor') and hasattr(model, 'target_transformer_encoder'):
+        try:
+            model.target_cnn_feature_extractor.load_state_dict(
+                model.online_cnn_feature_extractor.state_dict()
+            )
+            model.target_transformer_encoder.load_state_dict(
+                model.online_transformer_encoder.state_dict()
+            )
+            print("✅ Updated target encoders to match online encoders")
+        except Exception as e:
+            print(f"⚠️ Could not update target encoders: {e}")
+
+    print(f"🎯 Loaded model components for scenario: {scenario}")
+    print(f"📊 Components loaded: {loaded_components}")
+
+    return model, param_groups
+
+
+# Helper function to save model components
+def save_model_components(preset, model):
+    """Save model components based on preset configuration"""
+    if not preset.get("save_model"):
+        return
+
+    # Create save directory
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    save_dir = os.path.join(
+        preset.get("saving_path", "./saved_models"),
+        f"jepa_sup_{'+'.join(preset['data']['environment'])}_{timestamp}"
+    )
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save full model
+    model_path = os.path.join(save_dir, "full_model.pth")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': preset,
+        'environment': preset['data']['environment']
+    }, model_path)
+
+    print(f"💾 Model saved to: {model_path}")
+    return model_path
+
+def error_per_number_person(y_pred, y_true):
+    """
+    Args:
+        y_pred: numpy array of shape (num_samples, 9) containing prediction for each activity
+        y_true: numpy array of shape (num_samples, 9) containing true values
+
+    Returns:
+        error count if we have one activity, error count if we have two persons, and so on
+    """
+
+    count_num_people = y_true.sum(axis=1)
+    error_count = np.abs(y_pred - y_true).sum(axis=1)
+
+    error_per_person = []
+    for count_index in range(1, MAX_NB_PEOPLE):
+        index = np.where(count_num_people == count_index)[0]
+        if index.size == 0:
+            warnings.warn(f"No samples with {count_index} people in this batch — error_per_person[{count_index-1}] = NaN")
+            error_per_person.append(np.nan)
+        else:
+            error_per_person.append(error_count[index].mean())
+
+    return error_per_person
+
+def count_error(y_pred, y_true):
+    """
+    Args:
+        y_pred: numpy array of shape (num_samples, n) containing prediction n=9 for activity and 5 for location
+        y_true: numpy array of shape (num_samples, n) containing true values
+
+    Returns:
+        error for count number people in each sample, (num_samples, 1)
+    """
+    count_num_people_y = y_true.sum(axis=1) # finding number of people in each sample
+    count_num_people_y_pred = y_pred.sum(axis=1) # finding number of people in each sample
+    error_count = np.abs(count_num_people_y_pred - count_num_people_y) # finding error count in each sample
+    return error_count
+
+def threshold_round(x, threshold=0.3):
+    """
+    Custom rounding function that uses a threshold.
+    If decimal part > threshold, rounds up; otherwise rounds down.
+    """
+    # Get the decimal part
+    decimal_part = x - np.floor(x)
+    # Round up if decimal part > threshold, down otherwise
+    return np.ceil(x) if decimal_part > threshold else np.floor(x)
+
+def process_predictions(y_pred, y_true, var_threshold=0.5):
+    """
+    Process activity predictions to count activities above threshold.
+
+    Args:
+        y_pred: numpy array of shape (num_samples, 6, 9) containing probabilities
+        y_true: numpy array of shape (num_samples, 6, 9) containing true values
+        var_threshold: minimum probability threshold for counting an activity
+
+    Returns:
+        y_pred_processed: summed activity counts (num_samples, 9)
+        y_true_processed: summed true activity counts (num_samples, 9)
+        batch_size: number of samples in batch
+    """
+    # Get the indices of max probabilities for each user
+    max_indices = np.argmax(y_pred, axis=2)  # Shape: (num_samples, 6)
+
+    # Get the corresponding maximum probabilities
+    max_probs = np.take_along_axis(y_pred, np.expand_dims(max_indices, axis=2), axis=2)
+    max_probs = max_probs.squeeze(axis=2)  # Shape: (num_samples, 6)
+
+    # Create a mask for probabilities above threshold
+    above_threshold = max_probs > var_threshold  # Shape: (num_samples, 6)
+
+    # Create one-hot encoded matrix for the predicted activities
+    y_pred_one_hot = np.zeros_like(y_pred)  # Shape: (num_samples, 6, 9)
+    batch_indices = np.arange(y_pred.shape[0])[:, None]
+    user_indices = np.arange(y_pred.shape[1])[None, :]
+    y_pred_one_hot[batch_indices, user_indices, max_indices] = above_threshold
+
+    # Sum up the activities across users
+    y_pred_processed = y_pred_one_hot.sum(axis=1)  # Shape: (num_samples, 9)
+    y_true_processed = y_true.sum(axis=1)  # Shape: (num_samples, 9)
+
+    batch_size = y_true.shape[0]
+
+    return y_pred_processed, y_true_processed, batch_size
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+def build_run_stem(*var_parts):
+    """
+    [description]
+    : join non-empty tag parts into one filesystem-safe stem
+    """
+    var_parts = [str(var_part) for var_part in var_parts if var_part not in (None, "")]
+    var_stem = re.sub(r"[^A-Za-z0-9._+=-]+", "-", "_".join(var_parts))
+    return var_stem.strip("-_") or "run"
+
+
+def save_run_outputs(var_save_dir, var_protocol, var_stem, var_result, var_formatted):
+    """
+    [description]
+    : write a run's outputs to auto-named files under <save_dir>/<protocol>/:
+        <stem>.json  full result dict (self-describing config + metrics)
+        <stem>.txt   human-readable formatted report
+    : return: (json_path, txt_path)
+    """
+    var_dir = os.path.join(var_save_dir, var_protocol)
+    os.makedirs(var_dir, exist_ok=True)
+    var_json_path = os.path.join(var_dir, f"{var_stem}.json")
+    var_txt_path = os.path.join(var_dir, f"{var_stem}.txt")
+    with open(var_json_path, "w") as var_file:
+        json.dump(var_result, var_file, indent=4, cls=NumpyEncoder)
+    with open(var_txt_path, "w") as var_file:
+        var_file.write(var_formatted + "\n")
+    return var_json_path, var_txt_path
+
+
+def run_timestamp():
+    """
+    [description]
+    : unique-per-run timestamp for output file stems (second resolution).
+    """
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def join_envs(var_envs):
+    """
+    [description]
+    : render a list of room names as a single filename-safe token, e.g. ["empty_room","classroom"] ->
+      "empty_room+classroom".
+    """
+    if isinstance(var_envs, str):
+        var_envs = [var_envs]
+    return "+".join(str(var_env) for var_env in var_envs)
+
+
+def format_decision(var_metrics):
+    """
+    [description]
+    : one-line summary of the decision
+    : var_metrics: a result dict, per-environment or single-model, with any of avg_threshold /
+      avg_empty_threshold / avg_peak_threshold / avg_per_person_mass
+    : return: str, "" when none of those keys are present
+    """
+    var_specs = (("avg_threshold", "Thr", "%.4f"),
+                 ("avg_empty_threshold", "EmptyThr", "%.4f"),
+                 ("avg_peak_threshold", "peakThr", "%.4f"),
+                 ("avg_per_person_mass", "mass/person", "%.3f"))
+    var_parts = []
+    for var_key, var_label, var_fmt in var_specs:
+        if var_key not in var_metrics:
+            continue
+        var_value = float(var_metrics[var_key])
+        var_parts.append(f"{var_label} " + (var_fmt % var_value if np.isfinite(var_value) else "nan"))
+    return " - ".join(var_parts)
+
+
+def calculate_scores(y_true, y_pred):
+    """
+    Calculate all performance metrics for the predictions
+    Args:
+        y_true: numpy array of ground truth values
+        y_pred: numpy array of predicted values
+    Returns:
+        Dictionary containing all performance metrics
+
+    """
+    # Calculate basic metrics
+    absolute_diff = np.abs(y_true - y_pred)
+
+    # Calculate TP, TN, FP, FN
+    tp = np.minimum(y_true, y_pred)
+    tn = np.where(np.maximum(y_true, y_pred) == 0, 1, 0)
+    fp = np.maximum(0, y_pred - y_true) # Extra predictions
+    fn = np.maximum(0, y_true - y_pred)  # Missed objects
+
+    # Calculate per-activity metrics
+    tp_per_activity = tp.sum(axis=0)
+    tn_per_activity = tn.sum(axis=0)
+    fp_per_activity = fp.sum(axis=0)
+    fn_per_activity = fn.sum(axis=0)
+
+    # Calculate precision, recall, f1-score
+    precision_ = np.where((tp_per_activity + fp_per_activity) > 0,
+                         tp_per_activity / (tp_per_activity + fp_per_activity + 1e-6), 0)
+    recall_ = np.where((tp_per_activity + fn_per_activity) > 0,
+                      tp_per_activity / (tp_per_activity + fn_per_activity + 1e-6), 0)
+    f1_score_ = np.where((precision_ + recall_) > 0,
+                        2 * (precision_ * recall_) / (precision_ + recall_ + 1e-6), 0)
+    accuracy_ = (tp_per_activity + tn_per_activity) / (tp_per_activity + fn_per_activity + tn_per_activity + fp_per_activity)
+
+    ## Metrics that ignore class absence (see the docstring). A class is "present" when the ground
+    ## truth has at least one instance of it; present_f1 / present_recall average over those classes
+    ## only, and micro_f1 pools every class and sample into one 2 TP / (2 TP + FP + FN).
+    present = (tp_per_activity + fn_per_activity) > 0
+    micro_tp, micro_fp, micro_fn = tp.sum(), fp.sum(), fn.sum()
+    micro_denominator = 2 * micro_tp + micro_fp + micro_fn
+    micro_f1 = 2 * micro_tp / micro_denominator if micro_denominator > 0 else 0.0
+    present_f1 = float(f1_score_[present].mean()) if present.any() else 0.0
+    present_recall = float(recall_[present].mean()) if present.any() else 0.0
+
+    # Calculate perfect predictions
+    perfect_prediction_mask = np.all(absolute_diff == 0, axis=1)
+    perfect_predictions = np.sum(perfect_prediction_mask)
+    batch_size = len(y_true)
+    perfect_prediction_percentage = (perfect_predictions / batch_size) * 100
+
+    # Calculate total error
+    total_error = np.sum(absolute_diff) / batch_size
+
+    # Calculate error per person and counting error
+    error_per_person = error_per_number_person(y_pred, y_true)
+    counting_error_perPerson = count_error(y_pred, y_true)
+    mean_count_error = counting_error_perPerson.mean()
+
+    return {
+        'total_error': total_error,
+        'perfect_prediction_percentage': perfect_prediction_percentage,
+        'accuracy': accuracy_.mean(),
+        'error_per_person': error_per_person,
+        'mean_count_error': mean_count_error,
+        'counting_error_perPerson': counting_error_perPerson,
+        'precision': precision_.mean(),
+        'recall': recall_.mean(),
+        'f1_score': f1_score_.mean(),
+        'micro_f1': micro_f1,
+        'present_f1': present_f1,
+        'present_recall': present_recall
+    }
+
+def my_train_test_split(X, y_location_n, y_activity_n, test_size=0.2, random_state=103):
+    m = X.shape[0]
+    rng = np.random.RandomState(random_state)
+    random_indices = np.arange(0, m)
+    rng.shuffle(random_indices)
+    m_train = int(m * (1 - test_size))
+    indices_train = random_indices[0:m_train]
+    indices_test = random_indices[m_train:]
+    X_train = X[indices_train]
+    X_test = X[indices_test]
+    y_train_loc = y_location_n[indices_train]
+    y_test_loc = y_location_n [indices_test]
+    y_train_act = y_activity_n[indices_train]
+    y_test_act = y_activity_n [indices_test]
+
+    return X_train, X_test, y_train_loc, y_test_loc, y_train_act, y_test_act
+def performance_metrics_joint_multiSensX(y_true_act, y_pred_act, y_true_loc, y_pred_loc):
+    y_true_act = np.array(y_true_act)
+    y_pred_act = np.array(y_pred_act)
+    y_true_loc = np.array(y_true_loc)
+    y_pred_loc = np.array((y_pred_loc>0.5).astype(int) ) # batch size by 5
+
+    y_pred_indices = np.argmax(y_pred_act, axis=-1)
+    y_pred_act = np.eye(y_pred_act.shape[-1])[y_pred_indices]
+
+    # batchsize by 5 by 9
+    mask_ = y_pred_loc==0
+    y_pred_act[mask_] = [0 ,0 ,0 ,0 ,0 , 0, 0, 0, 0]
+    y_pred_act = y_pred_act.sum(axis=1)
+
+
+
+    y_true_act = y_true_act.sum(axis=1)
+
+    # Metrics for activity prediction
+    act_metrics = calculate_scores(y_true_act, y_pred_act)
+    # Metrics for location prediction
+    loc_metrics = calculate_scores(y_true_loc, y_pred_loc)
+    return act_metrics, loc_metrics
+
+def performance_metrics_joint(y_true_act, y_pred_act, y_true_loc, y_pred_loc):
+    # Ensure inputs are numpy arrays
+    y_true_act = np.array(y_true_act)
+    y_pred_act = np.array(y_pred_act)
+    y_true_loc = np.array(y_true_loc)
+    y_pred_loc = np.array(y_pred_loc)
+    last_act_pred = y_pred_act[-1]
+    last_loc_pred = y_pred_loc[-1]
+    batch_size, num_heads, num_classes_act = last_act_pred.shape
+    num_classes_loc = last_loc_pred.shape[-1]
+
+
+    ## Creating predicted indicies in order to convert it to one hot encoded
+    y_pred_indices_act = np.argmax(last_act_pred, axis=-1)
+    y_pred_indices_loc = np.argmax(last_loc_pred, axis=-1)
+    last_act_pred = np.eye(num_classes_act)[y_pred_indices_act]
+    last_loc_pred = np.eye(num_classes_loc)[y_pred_indices_loc] #
+    ##
+
+    last_loc_pred[y_pred_indices_act == 9] = np.zeros(num_classes_loc)
+    last_loc_pred = last_loc_pred.sum(axis=1)
+    last_act_pred = last_act_pred.sum(axis=1)
+
+    y_true_loc = y_true_loc.sum(axis=1)
+    y_true_act = y_true_act.sum(axis=1)
+
+    # Metrics for activity prediction
+    act_metrics = calculate_scores(y_true_act, last_act_pred)
+
+    # Metrics for location prediction
+    loc_metrics = calculate_scores(y_true_loc, last_loc_pred)
+
+    return act_metrics, loc_metrics
+
+def performance_metrics(y_true, y_pred, var_mode="joint_multihead", var_threshold=0.5):
+    """
+    Process predictions based on mode and calculate performance metrics
+    Args:
+        y_true: numpy array of ground truth values
+        y_pred: numpy array of predicted values
+        var_mode: prediction mode
+        var_threshold: threshold for baseline mode
+    Returns:
+        Dictionary containing all performance metrics
+    """
+    # Ensure inputs are numpy arrays
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    # Process predictions based on mode
+    if var_mode == "count_classification_withConstrain":
+        pass
+    elif var_mode == "multi_head":
+        # Initialize dictionary to store metrics for each layer
+        all_layer_metrics = {}
+        # Process each layer's predictions
+        for layer_idx in range(len(y_pred)):
+            layer_pred = y_pred[layer_idx]
+            # Convert predictions to one-hot encoded format
+            y_pred_indices = np.argmax(layer_pred, axis=-1)
+
+            layer_pred_one_hot = np.eye(layer_pred.shape[-1])[y_pred_indices]
+            # Sum across heads
+            layer_pred_sum = layer_pred_one_hot.sum(axis=1)
+            y_true_sum = y_true.sum(axis=1)
+
+            # Remove the last class (no-object class)
+            layer_pred_sum = layer_pred_sum[:, :-1]
+            y_true_sum = y_true_sum[:, :-1]
+
+            # Calculate metrics for this layer
+            layer_metrics = calculate_scores(y_true_sum, layer_pred_sum)
+            all_layer_metrics[f'layer_{layer_idx}'] = layer_metrics
+
+            # Store the last layer metrics at the top level for backward compatibility
+            if layer_idx == len(y_pred) - 1:
+                all_layer_metrics.update(layer_metrics)
+
+        return all_layer_metrics
+    elif var_mode == "count_classification":
+        batch_size, num_classes = y_pred.shape
+        # Apply custom threshold rounding and clipping
+        threshold_round_vec = np.vectorize(threshold_round)
+        y_pred = np.clip(threshold_round_vec(y_pred, threshold=0.5), a_min=0, a_max=5)
+    elif var_mode == "baseline":
+        y_pred = (1 / (1 + np.exp(-y_pred))).astype(float)
+        y_true = y_true.reshape(y_true.shape[0], -1, 9)
+        y_pred = y_pred.reshape(y_true.shape[0], y_true.shape[1], y_true.shape[2])
+        y_pred, y_true, _ = process_predictions(y_pred, y_true, var_threshold=0.5)
+    else:
+        raise ValueError(f"Unsupported var_mode: {var_mode}")
+
+    # Calculate all metrics
+    return calculate_scores(y_true, y_pred)
+
+def reduce_dataset_joint_multiSenseX(data_activity, data_location):
+    new_data_activity = []
+    y_location_n = data_location.sum(axis=1)
+    for i in range(0, data_location.shape[0]):
+        sample_activity = data_activity[i]
+        # Count non-zero rows-pp
+        legend_non_zero = sample_activity.sum(axis=1) # This gives us which queries are redundant or possible to eliminate
+
+
+        new_sample_activity = np.delete(sample_activity, (legend_non_zero == 0).argmax(), axis=0)
+
+
+        new_data_activity.append(new_sample_activity)
+    new_data_activity = np.array(new_data_activity)
+
+    return new_data_activity, y_location_n
+
+
+def reduce_dataset_joint(data_activity, data_location, num_object_queries=None):
+    new_data_activity = []
+    new_data_location = []
+
+    zero = np.zeros((5, 1))
+
+    for i in range(0, data_location.shape[0]):
+        sample_location = data_location[i]
+        sample_activity = data_activity[i]
+        # Count non-zero rows-pp
+        legend_non_zero = sample_activity.sum(axis=1) # This gives us which queries are redundant or possible to eliminate
+
+        new_sample_location= np.delete(sample_location, (legend_non_zero == 0).argmax(), axis=0) # deleting the first empy query
+
+        new_sample_activity = np.delete(sample_activity, (legend_non_zero == 0).argmax(), axis=0)
+
+
+        new_sample = np.hstack((new_sample_activity, zero))
+        legend_non_zero = new_sample.sum(axis=1)
+        new_sample[legend_non_zero == 0, :] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+
+
+        if num_object_queries:
+            new_matrix = np.repeat([[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]], num_object_queries-5, axis=0)
+            new_sample = np.concatenate((new_sample, new_matrix))
+        new_data_activity.append(new_sample)
+        new_data_location.append(new_sample_location)
+    # we expect to return two arrays...
+    return (np.array(new_data_activity), np.array(new_data_location))
+
+def reduce_dataset_dualband(data, indicies_, num_object_queries=None):
+    new_data = []
+    zero = np.zeros((5, 1))
+
+    for (i, sample) in enumerate(data):
+        # Count non-zero rows-pp
+        legend_non_zero = sample.sum(axis=1)
+        new_sample = np.delete(sample, (legend_non_zero == 0).argmax(), axis=0)
+        new_sample = np.hstack((new_sample, zero))
+        legend_non_zero = new_sample.sum(axis=1)
+        new_sample[legend_non_zero == 0, :] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        if num_object_queries:
+            new_matrix = np.repeat([[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]], num_object_queries-5, axis=0)
+            new_sample = np.concatenate((new_sample, new_matrix))
+        index_ = indicies_[i]
+        new_data.append(new_sample[index_])
+    return np.array(new_data)
+
+
+def reduce_dataset(data, var_task, num_object_queries=None):
+    new_data = []
+    zero = np.zeros((5, 1))
+
+    if var_task == "location":
+        mask_vector = [0, 0, 0, 0, 0, 1]
+    else:
+        mask_vector = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    for sample in data:
+        # Count non-zero rows-pp
+        legend_non_zero = sample.sum(axis=1)
+        new_sample = np.delete(sample, (legend_non_zero == 0).argmax(), axis=0)
+        new_sample = np.hstack((new_sample, zero))
+        legend_non_zero = new_sample.sum(axis=1)
+        new_sample[legend_non_zero == 0, :] = mask_vector
+        if num_object_queries:
+            new_matrix = np.repeat([mask_vector], num_object_queries-5, axis=0)
+            new_sample = np.concatenate((new_sample, new_matrix))
+        indices = np.random.permutation(num_object_queries)
+        new_data.append(new_sample[indices])
+    return np.array(new_data)
+
+
+def threshold_round(x, threshold=0.3):
+    frac = x - np.floor(x)
+    return np.floor(x) if frac < threshold else np.ceil(x)
+
+
+def visualize_model_performance(y_pred, y_true, save_dir="./visualizations",
+                                 var_mode="multi_head", class_names=("a", "b", "c", "d", "e"),
+                                 var_threshold=0.5):
+    """
+    Creates and saves various visualizations of model performance
+    y_pred: numpy array [batch_size, 10] (predicted counts)
+    y_true: numpy array [batch_size, 10] (true counts)
+    var_threshold: binarization threshold for var_mode="occupancy" (the density-map count rule)
+    """
+
+    if var_mode == "count_classification_withConstrain":
+        pass
+    elif var_mode == "occupancy":
+        ## density-map group counting: y_pred holds per-location occupancy probabilities and y_true
+        ## the 0/1 occupancy targets. Binarize at the calibrated count threshold so the per-location
+        ## confusion matrices and MAE reflect the same decision rule as the reported count.
+        y_pred = (np.asarray(y_pred) > var_threshold).astype(float)
+        y_true = np.asarray(y_true).astype(float)
+    elif var_mode == "multi_head":
+        y_pred = y_pred[-1]
+        batch_size, num_heads, num_classes = y_pred.shape
+
+        y_pred_indices = np.argmax(y_pred, axis=-1)
+        y_pred = np.eye(num_classes)[y_pred_indices]
+        y_pred = y_pred.sum(axis=1)
+        y_true = y_true.sum(axis=1)
+        y_pred = y_pred[:, :-1]
+        y_true = y_true[:, :-1]
+
+    elif var_mode == "count_classification":
+        batch_size, num_classes = y_pred.shape
+        threshold_round_vec = np.vectorize(threshold_round)
+        y_pred = np.clip(threshold_round_vec(y_pred, threshold=0.3), a_min=0, a_max=5)
+    elif var_mode == "baseline":
+        y_pred = (1 / (1 + np.exp(-y_pred)) > 0.5).astype(float)
+        y_true = y_true.reshape(y_true.shape[0], -1, 9)
+        y_pred = y_pred.reshape(y_true.shape[0], y_true.shape[1], y_true.shape[2])
+        y_pred = y_pred.sum(axis=1)
+        y_true = y_true.sum(axis=1)
+    else:
+        raise ValueError(f"Unsupported var_mode: {var_mode}")
+    os.makedirs(f"{save_dir}", exist_ok=True)
+
+    num_classes_plotted = int(y_pred.shape[1])
+    if len(class_names) != num_classes_plotted:
+        class_names = [f"Class {i}" for i in range(num_classes_plotted)]
+    ncols = min(5, num_classes_plotted)
+    nrows = int(np.ceil(num_classes_plotted / ncols))
+
+    # 1. Distribution of Predictions vs Ground Truth
+    plt.figure(figsize=(3 * ncols, 3.5 * nrows))
+    for i in range(num_classes_plotted):
+        plt.subplot(nrows, ncols, i + 1)
+        bins = np.arange(7)
+        width = 0.4
+        gt_counts, _ = np.histogram(y_true[:, i], bins=bins)
+        pred_counts, _ = np.histogram(y_pred[:, i], bins=bins)
+        x = bins[:-1]
+        plt.bar(x - width / 2, gt_counts, width=width, label='Ground Truth', color=GT_COLOR)
+        plt.bar(x + width / 2, pred_counts, width=width, label='Predicted', color=PRED_COLOR)
+        plt.title(class_names[i])
+        plt.xlabel('Count')
+        plt.ylabel('Frequency')
+        if i == 0:
+            plt.legend()
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/count_distributions.png')
+    plt.close()
+
+    # 2. Confusion Matrix for each class
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
+    for i in range(num_classes_plotted):
+        ax = axes[i // ncols, i % ncols]
+        cm = confusion_matrix(y_true[:, i], np.round(y_pred[:, i]))
+        sns.heatmap(cm, annot=True, fmt='d', ax=ax, cmap=CMAP,
+                    cbar_kws={'label': 'Count'})
+        ax.invert_yaxis()
+        ax.set_title(class_names[i])
+        ax.set_xlabel('Predicted Count')
+        ax.set_ylabel('True Count')
+
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/confusion_matrices.png')
+    plt.close()
+
+    # 2b. Confusion Matrix for each class normalized
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
+    for i in range(num_classes_plotted):
+        ax = axes[i // ncols, i % ncols]
+        cm = confusion_matrix(y_true[:, i], np.round(y_pred[:, i]), normalize='true')
+        sns.heatmap(cm, annot=True, fmt='.2f', ax=ax, cmap=CMAP,
+                    cbar_kws={'label': 'Count'})
+        ax.invert_yaxis()
+        ax.set_title(class_names[i])
+        ax.set_xlabel('Predicted Count')
+        ax.set_ylabel('True Count')
+
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/confusion_matrices_norm.png')
+    plt.close()
+
+    # 3. Error Distribution
+    plt.figure(figsize=(10, 6))
+    errors = np.abs(y_pred - y_true).mean(axis=1)
+    plt.hist(errors, bins=30, color=GT_COLOR, edgecolor='white')
+    plt.title('Distribution of Mean Absolute Error per Sample')
+    plt.xlabel('Mean Absolute Error')
+    plt.ylabel('Frequency')
+    plt.savefig(f'{save_dir}/error_distribution.png')
+    plt.close()
+
+    # 4. Class-wise Error Analysis
+    plt.figure(figsize=(10, 6))
+    class_errors = np.abs(y_pred - y_true).mean(axis=0)
+    bars = plt.bar(range(num_classes_plotted), class_errors, color=PRED_COLOR)
+    plt.xticks(range(num_classes_plotted), class_names, rotation=45, ha='right')
+    plt.bar_label(bars, fmt='%.3f', label_type='edge')
+    plt.title('Mean Absolute Error by location')
+    plt.xlabel('Location')
+    plt.ylabel('Mean Absolute Error')
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/class_errors.png')
+    plt.close()
+
+    # 5. Prediction vs Ground Truth
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
+    rng = np.random.default_rng(0)
+    cmap = sns.color_palette(CMAP, as_cmap=True)
+
+    for i in range(num_classes_plotted):
+        ax = axes[i // ncols, i % ncols]
+        yt = y_true[:, i]
+        yp = y_pred[:, i]
+
+        pairs, counts = np.unique(np.stack([yt, yp], axis=1), axis=0, return_counts=True)
+        jitter = 0.12
+        jx = pairs[:, 0] + rng.uniform(-jitter, jitter, size=len(pairs))
+        jy = pairs[:, 1] + rng.uniform(-jitter, jitter, size=len(pairs))
+
+        sizes = 20 + 180 * (counts / counts.max())
+        sc = ax.scatter(jx, jy, s=sizes, c=counts, cmap=cmap,
+                         alpha=0.85, edgecolors='white', linewidths=0.5)
+
+        lo = min(yt.min(), yp.min()) - 0.5
+        hi = max(yt.max(), yp.max()) + 0.5
+        ## the reference line shares the constant-baseline colour: on this figure the trivial "no
+        ## error" answer and on the position scatter the trivial "always predict the average" answer
+        ax.plot([lo, hi], [lo, hi], linestyle='--', color=CONST_COLOR, linewidth=1.2, label='y = x')
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_title(class_names[i])
+        ax.set_xlabel('True Count')
+        ax.set_ylabel('Predicted Count')
+        if i == 0:
+            ax.legend(loc='upper left', fontsize=8)
+        fig.colorbar(sc, ax=ax, label='# samples')
+
+    for j in range(num_classes_plotted, nrows * ncols):
+        axes[j // ncols, j % ncols].axis('off')
+
+    fig.suptitle('Predicted vs True Counts', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/prediction_scatter.png')
+    plt.close()
+
+    perfect_predictions = (np.abs(y_pred - y_true) < 0.5).all(axis=1).mean()
+    print(f"\nVisualizations saved at {save_dir}")
+    print("\nDetailed Performance Analysis:")
+    print(f"Mean Error: {errors.mean():.4f} ± {errors.std():.4f}")
+    print("\nClass-wise Mean Absolute Error:")
+    for i, error in enumerate(class_errors.tolist()):
+        print(f"Class {class_names[i]}: {error:.4f}")
+    print(f"\nPerfect Predictions: {perfect_predictions * 100:.2f}%")
+
+    return {
+        'class_wise_mae': class_errors.tolist(),
+        'mean_error': errors.mean(),
+        'error_std': errors.std(),
+        'perfect_predictions': perfect_predictions
+    }
+
+
+def visualize_room_grid_performance(var_true_sets, var_pred_sets, var_save_dir, var_grid=5,
+                                    var_threshold=0.5):
+    """
+    [description]
+    : grid-cell occupancy view of multi-user localization, for rooms without discrete locations. The
+      room's shared [0, 1]^2 frame is split into var_grid x var_grid cells, each cell is treated as a
+      "location".
+    : var_true_sets / var_pred_sets: lists (one per sample) of (k, 2) normalized position arrays
+    : return: the dict returned by visualize_model_performance
+    """
+    #
+    var_num = len(var_true_sets)
+    var_true = np.zeros((var_num, var_grid * var_grid), dtype=np.float32)
+    var_pred = np.zeros_like(var_true)
+    for var_sets, var_out in ((var_true_sets, var_true), (var_pred_sets, var_pred)):
+        for var_idx, var_pos in enumerate(var_sets):
+            var_pos = np.asarray(var_pos, dtype=np.float64).reshape(-1, 2)
+            if var_pos.size == 0:
+                continue
+            var_row = np.clip((var_pos[:, 1] * var_grid).astype(int), 0, var_grid - 1)
+            var_col = np.clip((var_pos[:, 0] * var_grid).astype(int), 0, var_grid - 1)
+            var_out[var_idx, var_row * var_grid + var_col] = 1.0
+    var_class_names = [f"c{var_row}{var_col}"
+                       for var_row in range(var_grid) for var_col in range(var_grid)]
+    #the standard per-location figures are produced from cell occupancy
+    return visualize_model_performance(var_pred, var_true, save_dir=var_save_dir, var_mode="occupancy",
+                                       class_names=var_class_names, var_threshold=var_threshold)
+
+
+def location_label_positions(var_labels, var_positions, var_mode="sets", var_threshold=0.3):
+    """
+    [description]
+    : the (x, y) positions of the locations a batch of labels marks as occupied, pooled over the
+      batch, so a location run can be plotted in space and not only per location. The set-prediction
+      models carry the locations as one-hot sets, the count baselines as a per-location readout.
+    : var_labels: (n, Q, C) one-hot sets (var_mode="sets"; the last class is the no-object slot) or
+      (n, C) per-location counts / occupancy scores (var_mode="counts")
+    : var_positions: dict, class index -> (x, y) in meters
+    : return: (M, 2) float array of positions
+    """
+    #
+    ##
+    var_labels = np.asarray(var_labels)
+    if var_mode == "sets":
+        var_index = np.argmax(var_labels, axis=-1)
+        var_ids = var_index[var_index != var_labels.shape[-1] - 1]
+    elif var_mode == "counts":
+        var_threshold_vec = np.vectorize(threshold_round)
+        var_ids = np.where(var_threshold_vec(var_labels, threshold=var_threshold).ravel() > 0)[0]
+        var_ids = var_ids % var_labels.shape[1]
+    else:
+        raise ValueError(f"unsupported var_mode: {var_mode}")
+    var_ids = [int(var_idx) for var_idx in var_ids if int(var_idx) in var_positions]
+    return np.array([var_positions[var_idx] for var_idx in var_ids], dtype=float).reshape(-1, 2)
+
+
+def location_mean_position(var_counts, var_positions):
+    """
+    [description]
+    : the occurrence-weighted mean of the location positions a training set holds: the constant
+    : var_counts: (C,) how many training frames mark each class index
+    : var_positions: {class index: (x, y)} in meters, of the room the baseline is placed in
+    : return: (1, 2) float array, or (0, 2) when the labels hold no position at all
+    """
+    #
+    ##
+    var_counts = np.asarray(var_counts, dtype=float)
+    var_ids = [var_idx for var_idx in var_positions if var_idx < len(var_counts)]
+    var_weight = np.array([var_counts[var_idx] for var_idx in var_ids], dtype=float)
+    if var_weight.sum() <= 0:
+        return np.zeros((0, 2), dtype=float)
+    var_pos = np.array([var_positions[var_idx] for var_idx in var_ids], dtype=float)
+    return (var_pos * var_weight[:, None]).sum(axis=0, keepdims=True) / var_weight.sum()
+
+
+def location_prior_positions(var_counts, var_positions, var_max_rows=20000):
+    """
+    [description]
+    : the training locations as a cloud, one row per (training frame, location) occurrence, to be able to prove
+        that the model is learning to predict the training room's prior 
+    : var_counts: (C,) how many training frames mark each class index
+    : var_positions: {class index: (x, y)} in meters, of the room the prior is placed in
+    : return: (M, 2) float array, M <= var_max_rows + len(var_positions)
+    """
+    #
+    ##
+    var_counts = np.asarray(var_counts, dtype=float)
+    var_ids = [var_idx for var_idx in var_positions if var_idx < len(var_counts)]
+    var_weight = np.array([var_counts[var_idx] for var_idx in var_ids], dtype=float)
+    var_total = var_weight.sum()
+    if var_total <= 0:
+        return np.zeros((0, 2), dtype=float)
+    var_scale = min(1.0, var_max_rows / var_total)
+    var_repeat = np.maximum(1, np.round(var_weight * var_scale)).astype(int)
+    var_pos = np.array([var_positions[var_idx] for var_idx in var_ids], dtype=float)
+    return np.repeat(var_pos, var_repeat, axis=0)
+
+
+def visualize_location_position_scatter(var_true_pos, var_pred_pos, var_room, var_save_dir, var_bounds,
+                                        var_const_pos=None, var_const_label="constant baseline",
+                                        var_const_train_pos=None,
+                                        var_const_train_label="constant (mean training position)",
+                                        var_prior_pos=None, var_prior_label="training prior",
+                                        var_max_points=2000, var_seed=39):
+    """
+    [description]
+    : true against predicted location positions of one test room, in meters on the room frame: the
+      spatial counterpart of the per-location count scatter, and the readout of whether a cross-domain
+      location model puts people where they actually are. A model that spreads its predictions over
+      the room, or piles them on the training rooms' prior, has not transferred even when its
+      per-location counts look reasonable.
+    : var_true_pos / var_pred_pos: (M, 2) positions in meters (see location_label_positions)
+    : var_bounds: (x_min, x_max, y_min, y_max) in meters of the room frame
+    : var_const_pos: (M, 2) positions of the constant baseline (see location_mean_position), drawn as
+      one marker per distinct point: it predicts the same thing for every frame, so its cloud is the
+      point the model has to move away from. None = not drawn. A few-shot run passes the support mean
+      here and the training-room mean via var_const_train_pos, so both bars are on the figure.
+    : var_const_train_pos: (M, 2) positions of the training-room mean constant, drawn like
+      var_const_pos with its own colour. None = not drawn.
+    : var_prior_pos: (M, 2) positions of the data the model was trained on (see
+      location_prior_positions), drawn as a cloud *under* the predictions: where the model's
+      predictions sit on it, it has learned the training rooms' prior rather than the transfer. None =
+      not drawn.
+    : return: path of the written predictions_<room>.png
+    """
+    #
+    ##
+    var_true_pos = np.asarray(var_true_pos, dtype=float).reshape(-1, 2)
+    var_pred_pos = np.asarray(var_pred_pos, dtype=float).reshape(-1, 2)
+    var_series = []
+    if var_prior_pos is not None:
+        var_series.append((np.asarray(var_prior_pos, dtype=float).reshape(-1, 2), PRIOR_COLOR,
+                           var_prior_label, "s", 20, 0.5))
+    var_series += [(var_true_pos, GT_COLOR, "true", "o", 12, 0.5),
+                   (var_pred_pos, PRED_COLOR, "pred", "^", 16, 0.6)]
+    for var_pos, var_color, var_label in ((var_const_pos, CONST_COLOR, var_const_label),
+                                          (var_const_train_pos, CONST_TRAIN_COLOR, var_const_train_label)):
+        if var_pos is None:
+            continue
+        ## duplicates are dropped rather than drawn on top of each other
+        var_pos = np.unique(np.asarray(var_pos, dtype=float).reshape(-1, 2), axis=0)
+        var_series.append((var_pos, var_color, var_label, "X", 70, 0.9))
+    #
+    os.makedirs(str(var_save_dir), exist_ok=True)
+    var_fig, var_ax = plt.subplots(figsize=(7.4, 6))
+    for var_pos, var_color, var_label, var_marker, var_size, var_alpha in var_series:
+        if len(var_pos) == 0:
+            continue
+        var_show = var_pos
+        if len(var_pos) > var_max_points:
+            var_rng = np.random.RandomState(var_seed)
+            var_show = var_pos[np.sort(var_rng.choice(len(var_pos), var_max_points, replace=False))]
+        var_ax.scatter(var_show[:, 0], var_show[:, 1], s=var_size, c=var_color, alpha=var_alpha,
+                       marker=var_marker, label=var_label,
+                       edgecolors="white" if var_marker != "o" else "none", linewidths=0.8)
+    var_ax.set_xlim(var_bounds[0], var_bounds[1])
+    var_ax.set_ylim(var_bounds[2], var_bounds[3])
+    var_ax.set_aspect("equal")
+    var_ax.set_xlabel("x (m)")
+    var_ax.set_ylabel("y (m)")
+    var_ax.set_title(f"{var_room} - true vs predicted locations")
+    ## the legend sits beside the axes, not inside them: the upper-right corner of the room is where a
+    ## model that has not transferred piles its predictions, and the box would cover exactly those
+    var_ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    var_path = os.path.join(str(var_save_dir), f"predictions_{var_room}.png")
+    var_fig.tight_layout()
+    ## bbox_inches="tight" grows the saved canvas to the legend, which tight_layout does not account for
+    var_fig.savefig(var_path, dpi=120, bbox_inches="tight")
+    plt.close(var_fig)
+    return var_path
+
+
+def log_attention_weights(model, y_pred, y_actual, epoch, var_task = "activity"):
+    """
+    Log averaged attention weights from all decoder layers to wandb based on count of people.
+    For each count (0-4), select one random sample and visualize its averaged attention weights across all decoder layers.
+    """
+    # Convert numpy arrays to torch tensors if needed
+    if isinstance(y_actual, np.ndarray):
+        y_actual = torch.from_numpy(y_actual)
+    if isinstance(y_pred, np.ndarray):
+        y_pred = torch.from_numpy(y_pred)
+
+    # Get count of people (number of non-9 values) in each sequence
+    if var_task == "location":
+        where_n_happens = y_actual == LOCATION_SIZE
+        count_no_person = torch.sum(~where_n_happens, dim=1)
+    else:
+        where_n_happens = y_actual == ACTIVITY_SIZE
+        count_no_person = torch.sum(~where_n_happens, dim=1)
+
+    decoder_layers = model.decoder.decoder_layers
+
+    # For each possible count (0, 1, 2, 3, 4, 5)
+    for i in range(MAX_NB_PEOPLE):
+        # Find examples with this count
+        indices = torch.where(count_no_person == i)[0]
+        if len(indices) == 0:
+            continue
+
+        # Randomly select one example with this count - will be used for all layers
+        random_idx = indices[torch.randint(0, len(indices), (1,)).item()]
+
+        # Get actual labels and predictions for this example
+        actual_sequence = y_actual[random_idx].cpu().numpy()
+        pred_sequence = y_pred[random_idx].cpu().numpy()
+        num_layers = len(decoder_layers)
+        # Now iterate through layers using the same sample
+        for layer_idx, layer in enumerate(decoder_layers):
+            attn_weights = layer.cross_attn_weights
+            if attn_weights is None:
+                continue
+            attn_weights = attn_weights.detach().clone()
+            if layer_idx != num_layers - 1:
+                continue
+            # Assuming attn_weights shape is now [batch_size, num_heads, target_seq_len, source_seq_len]
+            example_attn_weights = attn_weights[random_idx]  # Shape: [num_heads, target_seq_len, source_seq_len]
+
+            # Average attention weights across all heads
+            avg_attn_weights = example_attn_weights.mean(dim=0)  # Shape: [target_seq_len, source_seq_len]
+
+            # Create a heatmap for the averaged attention weights
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(
+                avg_attn_weights.cpu().numpy(),
+                cmap='viridis',
+                xticklabels=range(avg_attn_weights.shape[1]),
+                yticklabels=[f'Q {j}' for j in range(avg_attn_weights.shape[0])],
+                cbar=True
+            )
+
+            # Add main title with sample info
+            plt.title(f'Average Cross-Attention Weights - Layer {layer_idx} - {i} People\n' +
+                        f'Sample Index: {random_idx}\n' +
+                        f'Actual: {actual_sequence}\n' +
+                        f'Prediction: {pred_sequence}',
+                        fontsize=14)
+
+            # Log to wandb
+            wandb.log({
+                f'attention_weights/layer_{layer_idx}_people_{i}': wandb.Image(plt.gcf()),
+            }, step=epoch)
+
+            plt.close('all')
+    return None
+def log_random_attention_weights_final(model, y_pred, y_actual, epoch, num_samples=50, var_task="activity"):
+    if isinstance(y_actual, np.ndarray):
+        y_actual = torch.from_numpy(y_actual)
+    if isinstance(y_pred, np.ndarray):
+        y_pred = torch.from_numpy(y_pred)
+
+    decoder_layers = model.decoder.decoder_layers
+    num_layers = len(decoder_layers)
+    last_layer_idx = num_layers - 1
+    last_layer = decoder_layers[last_layer_idx]
+
+    attn_weights = last_layer.cross_attn_weights
+    if attn_weights is None:
+        return
+    attn_weights = attn_weights.detach().clone()
+
+    # --- KEY FIX: use the attention weights' own batch size as the source of truth ---
+    attn_batch_size = attn_weights.shape[0]
+    batch_size = min(y_actual.shape[0], attn_batch_size)
+
+    # Truncate everything to the aligned batch size so indices can never overflow attn_weights
+    y_actual = y_actual[:batch_size]
+    y_pred = y_pred[:batch_size]
+    attn_weights = attn_weights[:batch_size]
+
+    if var_task == "location":
+        where_n_happens = y_actual == LOCATION_SIZE
+    else:
+        where_n_happens = y_actual == ACTIVITY_SIZE
+    count_no_person = torch.sum(~where_n_happens, dim=1)
+
+    # PART 1: random samples
+    num_to_select = min(int(num_samples), batch_size)
+    random_indices = torch.randperm(batch_size)[:num_to_select]
+
+    for sample_idx, random_idx in enumerate(random_indices):
+        actual_sequence = y_actual[random_idx].cpu().numpy()
+        pred_sequence = y_pred[random_idx].cpu().numpy()
+        people_count = count_no_person[random_idx].item()
+
+        example_attn_weights = attn_weights[random_idx]
+        avg_attn_weights = example_attn_weights.mean(dim=0)
+
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            avg_attn_weights.cpu().numpy(),
+            cmap='viridis',
+            xticklabels=range(avg_attn_weights.shape[1]),
+            yticklabels=[f'Q {j}' for j in range(avg_attn_weights.shape[0])],
+            cbar=True
+        )
+        plt.title(f'Average Cross-Attention Weights - Layer {last_layer_idx}\n'
+                  f'Sample {sample_idx+1}/{num_to_select} (Index: {random_idx}) - People Count: {people_count}\n'
+                  f'Actual: {actual_sequence}\n'
+                  f'Prediction: {pred_sequence}',
+                  fontsize=14)
+
+        wandb.log({
+            f'random_attention_weights/sample_{sample_idx+1}_layer_{last_layer_idx}': wandb.Image(plt.gcf()),
+        }, step=epoch)
+        plt.close('all')
+
+    # PART 2: averaged per people count
+    for i in range(MAX_NB_PEOPLE):
+        indices = torch.where(count_no_person == i)[0]
+        if len(indices) == 0:
+            continue
+
+        accumulated_attn = torch.zeros_like(attn_weights[indices[0]].mean(dim=0))
+        for idx in indices:
+            accumulated_attn += attn_weights[idx].mean(dim=0)
+        avg_count_attn = accumulated_attn / len(indices)
+
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            avg_count_attn.cpu().numpy(),
+            cmap='viridis',
+            xticklabels=range(avg_count_attn.shape[1]),
+            yticklabels=[f'Q {j}' for j in range(avg_count_attn.shape[0])],
+            cbar=True
+        )
+        plt.title(f'Average Cross-Attention Weights - Layer {last_layer_idx} - {i} People\n'
+                  f'Averaged across {len(indices)} samples',
+                  fontsize=14)
+
+        wandb.log({
+            f'average_attention_weights/count_{i}_layer_{last_layer_idx}': wandb.Image(plt.gcf()),
+        }, step=epoch)
+        plt.close('all')
+
+
+def select_device():
+    """Select CUDA, then MPS (Apple Silicon), then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+#
+##
+def reserve_viz_dir(path):
+    """
+    [description]
+    : claim a fresh figure/checkpoint directory for one run and return it as a Path.
+    : return: Path of the created directory
+    """
+    var_root = Path(f'./visualizations/{path}')
+    var_root.mkdir(parents=True, exist_ok=True)
+    var_index = 1
+    while True:
+        var_path = var_root / str(var_index)
+        try:
+            var_path.mkdir()
+            return var_path
+        except FileExistsError:
+            var_index += 1

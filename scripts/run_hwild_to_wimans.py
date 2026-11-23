@@ -1,0 +1,407 @@
+"""
+[file]          run_hwild_to_wimans.py
+[description]   Train a room-agnostic model on the H-WILD dataset and evaluate it on the WiMANS
+                locations, to ask whether a model trained on a completely different setup transfers
+                to rooms with a different geometry.
+
+                --model localizer (default): the single-target (x, y) regressor (RoomLocalizer) on
+                  single-occupant frames, in one shared transmitter-anchored metric frame, reporting
+                  the position error in meters. Cannot report occupancy -- it always emits a position.
+                --model density: the multi-user density head , which
+                  predicts an occupancy map and reports occupancy/detection and set-localization
+                  metrics. Rooms are kept in their own [0, 1]^2 frame  and every frame is kept -- multi-occupant and
+                  empty-room WiMANS frames included -- so the report answers the occupancy question.
+
+                Note: H-WILD has no empty frames which means testing on wimans with more than 1 user might not work 
+"""
+#
+##
+
+import argparse
+import os
+import random
+import sys
+import time
+
+import numpy as np
+import torch
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from configs.preset import preset
+from src.data.hwild import room_names as hwild_room_names, load_hwild_room, HWILD_ROOMS
+from src.data.unified_rooms import (load_wimans_room_targets, normalize_xy_meters,
+                                    wimans_room_names, load_unified_room, dataset_of,
+                                    room_span, room_bounds)
+from src.models.room_localization import (run_localization_cross_domain, format_localization_result,
+                                          localizer_class)
+from src.models.room_density import run_room_density_cross_domain, format_room_density_result
+from src.utils import save_run_outputs, build_run_stem, join_envs, run_timestamp, reserve_viz_dir
+
+#
+##
+
+
+def parse_args():
+    """
+    [description]
+    : command line arguments for the H-WILD -> WiMANS transfer run
+    """
+    #
+    ##
+    var_args = argparse.ArgumentParser()
+    var_args.add_argument("--model", default="localizer", choices=("localizer", "density"),
+                          help="'localizer' (default): the single-target RoomLocalizer, single-"
+                               "occupant frames, shared transmitter-anchored frame, position error in "
+                               "meters. 'density': the multi-user density head, per-room [0,1]^2 "
+                               "frames, every frame (empty and multi-occupant included), occupancy/"
+                               "detection + set-localization metrics.")
+    var_args.add_argument("--train_rooms", default=None, type=str,
+                          help="comma-separated H-WILD training rooms (default: all four)")
+    var_args.add_argument("--test_rooms", default=None, type=str,
+                          help="comma-separated WiMANS test rooms (default: all three)")
+    var_args.add_argument("--repeat", default=3, type=int, help="number of repeated experiments")
+    var_args.add_argument("--epochs", default=None, type=int, help="override preset['hwild']['epoch']")
+    var_args.add_argument("--window", default=None, type=int, help="window length in packets")
+    var_args.add_argument("--stride", default=None, type=int, help="window hop in packets")
+    var_args.add_argument("--data_root", default=None, type=str, help="override preset['hwild']['path']")
+    var_args.add_argument("--max_files", default=None, type=int,
+                          help="cap the H-WILD captures read per room (quick runs / smoke tests)")
+    var_args.add_argument("--max_samples", default=None, type=int,
+                          help="cap the WiMANS samples drawn per room")
+    var_args.add_argument("--users", default=None, type=str,
+                          help="comma-separated H-WILD volunteer ids, e.g. '1,2,3'")
+    var_args.add_argument("--interference", default=None, type=str,
+                          help="H-WILD 'w' (with interference), 'wo' (without), or 'w,wo'")
+    var_args.add_argument("--standardize", default="window", choices=("none", "window"),
+                          help="'window' z-scores each CSI window (removes the per-capture gain/AGC "
+                               "scale that otherwise differs between the two datasets); 'none' feeds "
+                               "raw amplitude")
+    var_args.add_argument("--backbone", default="that", choices=("that", "resnet1d"),
+                          help="which localizer the 'localizer' model trains (--model density ignores "
+                               "it). Each choice is a complete model, backbone plus its own regression "
+                               "head: 'that' (default) is RoomLocalizer over the WiMANS THAT backbone, "
+                               "'resnet1d' is ResNet1DLocalizer over the CSI window "
+                               "(src/models/resnet1d.py)")
+    var_args.add_argument("--hp", action="append", default=None, type=str, metavar="KEY=VALUE",
+                          help="Override a preset field, dotted path, e.g. "
+                               "--hp data.synth_wimans.enabled=true. Repeatable. Values are parsed as "
+                               "bool/int/float, else kept as str.")
+    #
+    return var_args.parse_args()
+
+
+def parse_hp_value(var_value):
+    """
+    [description]
+    : parse the right-hand side of a --hp override into a bool / int / float / str.
+    """
+    var_value = var_value.strip()
+    ## accept a quoted value, e.g. --hp path.save_dir='/tmp/x'
+    if len(var_value) >= 2 and var_value[0] == var_value[-1] and var_value[0] in ("'", '"'):
+        return var_value[1:-1]
+    var_lower = var_value.lower()
+    if var_lower in ("true", "false"):
+        return var_lower == "true"
+    if var_lower in ("none", "null"):
+        return None
+    try:
+        return int(var_value)
+    except ValueError:
+        pass
+    try:
+        return float(var_value)
+    except ValueError:
+        pass
+    return var_value
+
+
+def apply_hp_overrides(var_overrides):
+    """
+    [description]
+    : apply --hp overrides onto the module-level preset dict, in place, before any room is resolved or
+      model is built.
+    : return: dict, the applied {dotted_key: value} for the result record
+    """
+    var_applied = {}
+    for var_item in var_overrides or []:
+        var_key, var_sep, var_value = var_item.partition("=")
+        if not var_sep:
+            raise ValueError(f"--hp expects KEY=VALUE, got {var_item!r}")
+        var_target = preset
+        var_parts = var_key.strip().split(".")
+        for var_part in var_parts[:-1]:
+            if var_part not in var_target:
+                raise KeyError(f"--hp path {var_key!r}: preset has no {var_part!r}")
+            var_target = var_target[var_part]
+        var_parsed = parse_hp_value(var_value)
+        var_target[var_parts[-1]] = var_parsed
+        var_applied[var_key.strip()] = var_parsed
+    return var_applied
+
+
+def standardize_windows(var_x):
+    """
+    [description]
+    : z-score every CSI window over its time x subcarrier entries, so the amplitude level (which
+      carries an arbitrary per-device gain and AGC and differs between H-WILD and WiMANS) is removed
+      and only the window's frequency-selective shape is left.
+    : var_x: (N, window, features) float32
+    : return: same shape, float32
+    """
+    var_mu = var_x.mean(axis=(1, 2), keepdims=True)
+    var_sd = var_x.std(axis=(1, 2), keepdims=True) + 1e-6
+    return ((var_x - var_mu) / var_sd).astype(np.float32)
+
+
+def run_density(var_args, var_train_rooms, var_test_rooms, var_hp_applied, var_users,
+                var_interference):
+    """
+    [description]
+    : H-WILD -> WiMANS transfer with the multi-user density head: occupancy/detection and set
+      localization. Unlike the localizer path, rooms keep their own [0, 1]^2 frame (the convention
+      src/data/unified_rooms.py and run_lor_all.py use) and every frame is kept -- multi-occupant and
+      empty-room WiMANS frames included -- which is what the occupancy question needs. An H-WILD-only
+      training set has no empty frames, so the empty class cannot be learned from it; the WiMANS
+      empty-frame metrics expose exactly that.
+    """
+    #
+    ##
+    var_load_kwargs = {"var_root": var_args.data_root, "var_users": var_users,
+                       "var_interference": var_interference, "var_max_files": var_args.max_files}
+    train_sets_by_room, test_sets_by_room = {}, {}
+    for var_tag, var_rooms, var_sets in (("[train]", var_train_rooms, train_sets_by_room),
+                                         ("[test] ", var_test_rooms, test_sets_by_room)):
+        for var_room in var_rooms:
+            var_x, var_pos, var_mask = load_unified_room(
+                var_room, var_max_samples=var_args.max_samples,
+                var_length=preset["hwild"]["window"], **var_load_kwargs)
+            var_sets[var_room] = (var_x, var_pos, var_mask)
+            var_counts = var_mask.sum(axis=1)
+            print(f"{var_tag} {dataset_of(var_room):6s} {var_room:12s} X {var_x.shape} "
+                  f"users/sample min {int(var_counts.min())} max {int(var_counts.max())} "
+                  f"mean {var_counts.mean():.2f}")
+    if var_args.standardize == "window":
+        for var_sets in (train_sets_by_room, test_sets_by_room):
+            for var_room, (var_x, var_pos, var_mask) in var_sets.items():
+                var_sets[var_room] = (standardize_windows(var_x), var_pos, var_mask)
+        print("CSI: per-window z-score (gain/AGC removed)")
+    else:
+        print("CSI: raw amplitude")
+    #
+    ## per-room frames and spans (run_lor_all.py's convention): each room is its own [0, 1]^2, so the
+    ## model must place occupants without being told the room's absolute position or extent.
+    var_all_rooms = list(train_sets_by_room) + list(test_sets_by_room)
+    var_spans = {var_room: room_span(var_room) for var_room in var_all_rooms}
+    var_bounds = {var_room: room_bounds(var_room) for var_room in var_all_rooms}
+    #
+    var_save_path = reserve_viz_dir(
+        path=f"./visualizations/hwild_to_wimans_density/{'_'.join(var_train_rooms)}")
+    os.makedirs(var_save_path, exist_ok=True)
+    var_results = run_room_density_cross_domain(train_sets_by_room, test_sets_by_room,
+                                                var_repeat=var_args.repeat, save_path=var_save_path,
+                                                var_spans=var_spans, var_bounds=var_bounds)
+    #
+    var_result = {
+        "protocol": "train H-WILD -> test WiMANS, multi-user density head, per-room [0,1]^2 frames",
+        "model": "density",
+        "train_rooms": var_train_rooms,
+        "test_rooms": var_test_rooms,
+        "repeat": var_args.repeat,
+        "epochs": preset["nn"]["epoch"],
+        "window": preset["hwild"]["window"],
+        "stride": preset["hwild"]["stride"],
+        "max_files": var_args.max_files,
+        "max_samples": var_args.max_samples,
+        "users": var_users,
+        "interference": var_interference,
+        "standardize": var_args.standardize,
+        "hp_overrides": var_hp_applied,
+        "spans": {var_room: list(var_spans[var_room]) for var_room in var_all_rooms},
+        "ap_geometry": {
+            var_room: ({"ap_location": HWILD_ROOMS[var_room]["ap_location"],
+                        "ap_toward": HWILD_ROOMS[var_room]["ap_toward"]}
+                       if var_room in hwild_room_names()
+                       else {"ap_location": (0.0, 0.0), "ap_toward": (0.0, 0.0)})
+            for var_room in var_train_rooms
+        },
+        "per_env": var_results,
+    }
+    #
+    var_formatted = format_room_density_result(var_train_rooms, var_test_rooms, var_results)
+    var_stem = build_run_stem("hwild_to_wimans", "density",
+                              f"train-{join_envs(var_train_rooms)}", f"test-{join_envs(var_test_rooms)}",
+                              f"r{var_args.repeat}", f"e{preset['nn']['epoch']}",
+                              var_args.standardize, run_timestamp())
+    var_json_path, var_txt_path = save_run_outputs(
+        preset["path"].get("save_dir", "output"), "hwild_to_wimans", var_stem, var_result, var_formatted)
+    #
+    print(var_formatted)
+    print(f"\nResults saved to: {var_json_path}")
+    print(f"Report saved to:  {var_txt_path}")
+
+
+def run():
+    """
+    [description]
+    : run the H-WILD -> WiMANS transfer
+    """
+    #
+    ##
+    SEED = 103
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    #
+    var_args = parse_args()
+    var_hp_applied = apply_hp_overrides(var_args.hp)
+    var_train_rooms = ([var_room.strip() for var_room in var_args.train_rooms.split(',')]
+                       if var_args.train_rooms else hwild_room_names())
+    var_test_rooms = ([var_room.strip() for var_room in var_args.test_rooms.split(',')]
+                      if var_args.test_rooms else wimans_room_names())
+    # check no overlap between train and test rooms
+    if set(var_train_rooms) & set(var_test_rooms):
+        raise ValueError(f"train rooms {var_train_rooms} and test rooms {var_test_rooms} overlap")
+
+    if var_args.window is not None:
+        preset["hwild"]["window"] = var_args.window
+    if var_args.stride is not None:
+        preset["hwild"]["stride"] = var_args.stride
+    if var_args.epochs is not None:
+        if var_args.model == "density":
+            preset["nn"]["epoch"] = var_args.epochs
+        else:
+            preset["hwild"]["epoch"] = var_args.epochs
+    if var_args.data_root is not None:
+        preset["hwild"]["path"] = var_args.data_root
+    var_users = [var_user.strip() for var_user in var_args.users.split(',')] if var_args.users else None
+    var_interference = ([var_i.strip() for var_i in var_args.interference.split(',')]
+                        if var_args.interference else None)
+    #
+    if var_args.model == "density":
+        if var_args.backbone != "that":
+            raise ValueError("--backbone applies to --model localizer; the density head builds its own "
+                             "backbone")
+        run_density(var_args, var_train_rooms, var_test_rooms, var_hp_applied, var_users,
+                    var_interference)
+        return
+    #
+    ## --------------------------- load both datasets in the TX frame -------------------------------
+    ## H-WILD positions come back as meters from the capture's AP, +y along the AP boresight.
+    var_load_kwargs = {"var_root": var_args.data_root, "var_users": var_users,
+                       "var_interference": var_interference, "var_max_files": var_args.max_files}
+    train_sets_by_room, test_sets_by_room = {}, {}
+    for var_room in var_train_rooms:
+        if var_room in hwild_room_names():
+            var_x, var_y, var_meta = load_hwild_room(var_room, var_frame="tx", **var_load_kwargs)
+            train_sets_by_room[var_room] = (var_x, var_y)
+            print(f"[train] {var_room:12s} X {var_x.shape} XY {var_y.shape} "
+                f"({var_meta['num_files']} captures)")
+        elif var_room in wimans_room_names():
+            var_x, var_y = load_wimans_room_targets(var_room, var_max_samples=var_args.max_samples,
+                                                    var_length=preset["hwild"]["window"])
+            if len(var_x) == 0:
+                raise ValueError(f"no single-occupant WiMANS frames for {var_room!r}")
+            train_sets_by_room[var_room] = (var_x, var_y)
+            print(f"[train] {var_room:12s} X {var_x.shape} XY {var_y.shape} "
+                  f"({len(np.unique(var_y.round(3), axis=0))} distinct positions)")
+    ## WiMANS positions are already meters from the transmitter (preset["layouts"]); only the
+    ## single-occupant frames are kept, since the localizer predicts one position.
+    for var_room in var_test_rooms:
+        if var_room in hwild_room_names():
+            var_x, var_y, var_meta = load_hwild_room(var_room, var_frame="tx", **var_load_kwargs)
+            test_sets_by_room[var_room] = (var_x, var_y)
+            print(f"[test]  {var_room:12s} X {var_x.shape} XY {var_y.shape} "
+                f"({var_meta['num_files']} captures)")
+        elif var_room in wimans_room_names():
+            var_x, var_y = load_wimans_room_targets(var_room, var_max_samples=var_args.max_samples,
+                                                    var_length=preset["hwild"]["window"])
+            if len(var_x) == 0:
+                raise ValueError(f"no single-occupant WiMANS frames for {var_room!r}")
+            test_sets_by_room[var_room] = (var_x, var_y)
+            print(f"[test]  {var_room:12s} X {var_x.shape} XY {var_y.shape} "
+                f"({len(np.unique(var_y.round(3), axis=0))} distinct positions)")
+    #
+    ## ------------------------------------ shared frame --------------------------------------------
+    ## One rectangle over every loaded position defines the frame both datasets are normalised into,
+    ## so a normalised offset means the same metric offset in H-WILD and WiMANS. Its origin is the
+    ## transmitter, +y away, +x right (all positions are already in that frame).
+    var_all_xy = np.concatenate([var_y for _, var_y in list(train_sets_by_room.values())
+                                 + list(test_sets_by_room.values())])
+    var_margin = 0.5
+    var_rect = (float(var_all_xy[:, 0].min() - var_margin), float(var_all_xy[:, 0].max() + var_margin),
+                float(var_all_xy[:, 1].min() - var_margin), float(var_all_xy[:, 1].max() + var_margin))
+    var_span = (var_rect[1] - var_rect[0], var_rect[3] - var_rect[2])
+    print(f"\nTransmitter-anchored frame rectangle (m): x [{var_rect[0]:.2f}, {var_rect[1]:.2f}], "
+          f"y [{var_rect[2]:.2f}, {var_rect[3]:.2f}]  (span {var_span[0]:.2f} x {var_span[1]:.2f} m)")
+    #
+    if var_args.standardize == "window":
+        for var_sets in (train_sets_by_room, test_sets_by_room):
+            for var_room, (var_x, var_y) in var_sets.items():
+                var_sets[var_room] = (standardize_windows(var_x), var_y)
+        print("CSI: per-window z-score (gain/AGC removed)")
+    else:
+        print("CSI: raw amplitude")
+    #
+    ## normalise every room by the one shared rectangle
+    for var_sets in (train_sets_by_room, test_sets_by_room):
+        for var_room, (var_x, var_y) in var_sets.items():
+            var_sets[var_room] = (var_x, normalize_xy_meters(var_y, var_rect))
+    ## the harness converts a normalised error back to meters by multiplying by the span, so the
+    ## shared rectangle's span gives the true Euclidean distance in meters for every room.
+    var_spans = {var_room: var_span for var_room in list(train_sets_by_room) + list(test_sets_by_room)}
+    var_bounds = {var_room: var_rect for var_room in list(train_sets_by_room) + list(test_sets_by_room)}
+    #
+    ## --------------------------------------- run the model ----------------------------------------
+    var_save_path = reserve_viz_dir(path=f"./visualizations/hwild_to_wimans/{'_'.join(var_train_rooms)}")
+    os.makedirs(var_save_path, exist_ok=True)
+    var_results = run_localization_cross_domain(train_sets_by_room, test_sets_by_room,
+                                                var_repeat=var_args.repeat, save_path=var_save_path,
+                                                var_spans=var_spans, var_bounds=var_bounds,
+                                                var_model_factory=localizer_class(var_args.backbone))
+    #
+    var_result = {
+        "protocol": "train H-WILD -> test WiMANS, shared transmitter-anchored metric frame",
+        "backbone": var_args.backbone,
+        "train_rooms": var_train_rooms,
+        "test_rooms": var_test_rooms,
+        "repeat": var_args.repeat,
+        "epochs": preset["hwild"]["epoch"],
+        "window": preset["hwild"]["window"],
+        "stride": preset["hwild"]["stride"],
+        "max_files": var_args.max_files,
+        "max_samples": var_args.max_samples,
+        "users": var_users,
+        "interference": var_interference,
+        "standardize": var_args.standardize,
+        "hp_overrides": var_hp_applied,
+        "tx_frame_rect_m": var_rect,
+        "ap_geometry": {
+            var_room: ({"ap_location": HWILD_ROOMS[var_room]["ap_location"],
+                        "ap_toward": HWILD_ROOMS[var_room]["ap_toward"]}
+                    if var_room in hwild_room_names()
+                    else {"ap_location": (0.0, 0.0), "ap_toward": (0.0, 0.0)})
+            for var_room in var_train_rooms
+        },
+        "per_env": var_results,
+    }
+    #
+    var_formatted = format_localization_result(var_train_rooms, var_test_rooms, var_results)
+    var_stem = build_run_stem("hwild_to_wimans", "localization",
+                              f"train-{join_envs(var_train_rooms)}", f"test-{join_envs(var_test_rooms)}",
+                              f"r{var_args.repeat}", f"e{preset['hwild']['epoch']}",
+                              var_args.standardize, run_timestamp())
+    var_json_path, var_txt_path = save_run_outputs(
+        preset["path"].get("save_dir", "output"), "hwild_to_wimans", var_stem, var_result, var_formatted)
+    #
+    print(var_formatted)
+    print(f"\nResults saved to: {var_json_path}")
+    print(f"Report saved to:  {var_txt_path}")
+
+
+if __name__ == "__main__":
+    #
+    ##
+    var_start = time.time()
+    run()
+    print("Total time: %s seconds" % (time.time() - var_start))
